@@ -1,0 +1,1369 @@
+//! Parse SAM §1.7 base-modification tags (`MM`, `ML`) into a queryable
+//! [`BaseModState`]. Positions are resolved once at construction into
+//! stored-BAM-sequence coordinates; queries are zero-alloc lookups.
+//!
+//! MM positions in SAM are always relative to the **original, unreversed** read
+//! sequence. For reverse-strand alignments BAM stores the reverse-complemented
+//! sequence, so `BaseModState::parse` takes an `is_reverse` flag and resolves
+//! positions into stored-sequence coordinates up front — subsequent queries
+//! never re-read the strand.
+
+use fearless_simd::{Level, dispatch, prelude::*};
+use fearless_simd_macros::simd;
+use seqair_types::{Base, ModProbability, QPos};
+use thiserror::Error;
+
+use super::aux::{AuxValue, GetAuxError, find_tag};
+use super::cigar::{CigarMapping, CigarPosInfo};
+use super::record_store::{RecordAccessError, RecordStore, SlimRecord};
+
+/// Modification type code: a single-character SAM code (`m`, `h`, `a`, …) or a
+/// numeric `ChEBI` ontology id.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModType {
+    /// Single-character modification code (e.g. `m` for 5mC, `h` for 5hmC).
+    Code(u8),
+    /// Numeric `ChEBI` id (e.g. 27551 for 5mC).
+    ChEBI(u32),
+}
+
+/// Strand marker from the MM entry header.
+///
+/// This is the strand annotated in the MM tag itself, independent of whether
+/// the read itself is aligned on the reverse strand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModStrand {
+    Plus,
+    Minus,
+}
+
+/// Mode marker following the modification code(s) in an MM entry.
+///
+/// Determines how to treat positions not explicitly listed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModMode {
+    /// No marker. Unlisted positions have unknown modification status.
+    Implicit,
+    /// `.` marker. Unlisted positions are definitively unmodified.
+    Unmodified,
+    /// `?` marker. Unlisted positions are explicitly unknown.
+    Ambiguous,
+}
+
+// r[impl base_mod.modification_struct]
+// r[impl types.mod_probability.field_type]
+/// A single modification call on a single base.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Modification {
+    pub mod_type: ModType,
+    pub probability: ModProbability,
+    pub canonical_base: Base,
+    pub strand: ModStrand,
+}
+
+/// Errors produced by [`BaseModState::parse`].
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum BaseModError {
+    #[error("invalid canonical base in MM tag: {0:#x}")]
+    InvalidCanonicalBase(u8),
+    #[error("canonical base 'N' is not supported for modification resolution")]
+    UnsupportedUnknownBase,
+    #[error("invalid strand byte in MM tag: {0:#x}")]
+    InvalidStrand(u8),
+    #[error("missing modification code in MM entry")]
+    MissingModCode,
+    #[error("invalid modification code byte: {0:#x}")]
+    InvalidModCode(u8),
+    #[error("invalid ChEBI numeric id in MM tag")]
+    InvalidChebi,
+    #[error("invalid position delta in MM tag")]
+    InvalidDelta,
+    #[error("MM entry missing terminating ';'")]
+    MissingTerminator,
+    #[error("ML array length {ml} does not match total MM call count {mm}")]
+    MlLengthMismatch { ml: usize, mm: usize },
+    #[error(
+        "MM delta {delta} exceeds remaining count of canonical base {base:?} in sequence \
+         (is_reverse={is_reverse})"
+    )]
+    DeltaOutOfRange { delta: u32, base: Base, is_reverse: bool },
+    #[error("sequence length {len} exceeds u32::MAX; stored qpos cannot be represented")]
+    SeqTooLong { len: usize },
+}
+
+/// Errors produced by [`BaseModState::from_record`].
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum FromRecordError {
+    /// Failed to access the record's aux or sequence slab.
+    #[error(transparent)]
+    RecordAccess(#[from] RecordAccessError),
+    /// MM tag was present but not a `Z`-type string.
+    #[error("MM tag has wrong BAM type: {0}")]
+    BadMmTag(GetAuxError),
+    /// ML tag was present but not a `B:C` (unsigned 8-bit array).
+    #[error("ML tag has wrong BAM type: expected B:C, got {got}")]
+    BadMlTag { got: &'static str },
+    /// Parsing the MM/ML payload failed.
+    #[error(transparent)]
+    Parse(#[from] BaseModError),
+}
+
+// r[impl base_mod.state]
+/// Resolved modification calls for a single record, stored in
+/// stored-BAM-sequence coordinates.
+#[derive(Debug, Clone, Default)]
+pub struct BaseModState {
+    /// Parallel to `mods`: sorted ascending, ties grouped (same-qpos entries
+    /// are adjacent in insertion order, which preserves combined-code order).
+    qpos: Vec<u32>,
+    mods: Vec<Modification>,
+    /// For each canonical base (A,C,G,T → index 0..=3): is there any entry
+    /// whose mode is `Unmodified`? Used by `is_unmodified` to decide whether
+    /// an unlisted position can be called definitively unmodified.
+    any_unmodified_mode: [bool; 4],
+}
+
+impl BaseModState {
+    // r[impl base_mod.parse_mm]
+    // r[impl base_mod.validation]
+    /// Parse MM/ML tag values and resolve positions against `seq`.
+    ///
+    /// `seq` is the sequence as stored in BAM (already reverse-complemented
+    /// for reverse-strand reads). `is_reverse` is the read's reverse-strand
+    /// flag (`flag & 0x10 != 0`).
+    pub fn parse(
+        mm: &[u8],
+        ml: &[u8],
+        seq: &[Base],
+        is_reverse: bool,
+    ) -> Result<Self, BaseModError> {
+        let mut state = BaseModState::default();
+        // Collect (qpos, Modification) in insertion order so that
+        // combined-code entries stay adjacent at the same qpos; we sort at
+        // the end by qpos with a stable sort.
+        let mut pending: Vec<(u32, Modification)> = Vec::new();
+        let mut ml_cursor: usize = 0;
+        let mut bits = TargetBits::default();
+
+        // Tolerate a trailing NUL (Z-type strings are sometimes handed in with
+        // the NUL included) and an optional trailing empty segment.
+        let mm = mm.strip_suffix(&[0]).unwrap_or(mm);
+
+        let mut rest = mm;
+        while !rest.is_empty() {
+            let (entry, next) = split_entry(rest)?;
+            rest = next;
+            if entry.is_empty() {
+                // Stray `;` — skip.
+                continue;
+            }
+            parse_entry(
+                entry,
+                seq,
+                is_reverse,
+                ml,
+                &mut ml_cursor,
+                &mut pending,
+                &mut state,
+                &mut bits,
+            )?;
+        }
+
+        if ml_cursor != ml.len() {
+            return Err(BaseModError::MlLengthMismatch { ml: ml.len(), mm: ml_cursor });
+        }
+
+        // Stable sort by qpos preserves same-qpos insertion order.
+        pending.sort_by_key(|&(qp, _)| qp);
+        state.qpos.reserve(pending.len());
+        state.mods.reserve(pending.len());
+        for (qp, m) in pending {
+            state.qpos.push(qp);
+            state.mods.push(m);
+        }
+        Ok(state)
+    }
+
+    /// Parse MM/ML tags from a record into a resolved state, pulling MM,
+    /// ML, the stored sequence and the reverse-strand flag from
+    /// `(rec, store)` directly.
+    ///
+    /// # Returns
+    /// - `Ok(Some(state))` if the record carried an MM tag (with optional ML).
+    /// - `Ok(None)` if MM is absent — not an error.
+    /// - `Err(_)` if MM has the wrong BAM type, ML has the wrong BAM type,
+    ///   the slab access fails, or the payload is malformed (length
+    ///   mismatch, bad delta, …).
+    ///
+    /// When MM is present but ML is absent, an empty `&[]` is passed to
+    /// [`BaseModState::parse`]: that succeeds for delta lists of length 0
+    /// (no probabilities needed) and otherwise fails with
+    /// [`BaseModError::MlLengthMismatch`]. This is stricter than \[SAM1\]
+    /// §1.7 (which makes ML optional even when MM contains deltas) — seqair
+    /// currently rejects MM-with-deltas records that lack ML.
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// use seqair::bam::{BaseModState, FromRecordError};
+    ///
+    /// match BaseModState::from_record(rec, &store)? {
+    ///     Some(state) => { /* use state.mod_at_qpos(...) */ }
+    ///     None => { /* record has no MM tag — skip */ }
+    /// }
+    /// ```
+    pub fn from_record<U>(
+        rec: &SlimRecord,
+        store: &RecordStore<U>,
+    ) -> Result<Option<Self>, FromRecordError> {
+        let aux = rec.aux(store)?;
+        let mm: &[u8] = match aux.get("MM") {
+            Ok(bytes) => bytes,
+            Err(GetAuxError::TagNotFound { .. }) => return Ok(None),
+            Err(other) => return Err(FromRecordError::BadMmTag(other)),
+        };
+        let ml: &[u8] = match find_tag(aux.as_bytes(), *b"ML") {
+            Some(AuxValue::ArrayU8(bytes)) => bytes,
+            Some(other) => return Err(FromRecordError::BadMlTag { got: other.type_name() }),
+            None => &[],
+        };
+        let seq = rec.seq(store)?;
+        let state = Self::parse(mm, ml, seq, rec.flags.is_reverse())?;
+        Ok(Some(state))
+    }
+
+    /// Number of resolved modification calls.
+    pub fn len(&self) -> usize {
+        self.mods.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.mods.is_empty()
+    }
+
+    // r[impl base_mod.query_qpos]
+    /// All modifications called at the given stored-sequence position, or
+    /// `None` if no call is present.
+    ///
+    /// Takes a [`QPos`] — an offset into the read's sequence — not a genomic
+    /// position; see [`QPos`] for why the two are separate types.
+    pub fn mod_at_qpos(&self, qpos: QPos) -> Option<&[Modification]> {
+        let target = qpos.get();
+        let lo = self.qpos.partition_point(|&q| q < target);
+        let hi = self.qpos.partition_point(|&q| q <= target);
+        if lo == hi {
+            return None;
+        }
+        self.mods.get(lo..hi)
+    }
+
+    // r[impl base_mod.query_refpos]
+    /// Modifications at a reference position, mapped through `cigar`. Returns
+    /// `None` if the reference position is in a deletion/ref-skip or has no
+    /// modification call.
+    pub fn mod_at_ref_pos(
+        &self,
+        ref_pos: seqair_types::Pos0,
+        cigar: &CigarMapping,
+    ) -> Option<&[Modification]> {
+        match cigar.pos_info_at(ref_pos)? {
+            CigarPosInfo::Match { qpos } | CigarPosInfo::Insertion { qpos, .. } => {
+                self.mod_at_qpos(qpos)
+            }
+            CigarPosInfo::Deletion { .. }
+            | CigarPosInfo::RefSkip
+            | CigarPosInfo::ComplexIndel { .. } => None,
+        }
+    }
+
+    // r[impl base_mod.implicit_explicit]
+    /// Whether `qpos` is definitively unmodified, definitively modified, or
+    /// unknown.
+    pub fn is_unmodified(&self, qpos: QPos, canonical_base: Base) -> Option<bool> {
+        if self.mod_at_qpos(qpos).is_some() {
+            return Some(false);
+        }
+        let idx = canonical_base.known_index()?;
+        #[allow(clippy::indexing_slicing, reason = "known_index() returns Some(0..=3) for ACGT")]
+        let has_unmodified_mode = self.any_unmodified_mode[idx];
+        if has_unmodified_mode { Some(true) } else { None }
+    }
+}
+
+// ---- Parser ----
+
+/// Split off one `;`-terminated entry from the head of `mm`.
+fn split_entry(mm: &[u8]) -> Result<(&[u8], &[u8]), BaseModError> {
+    let sc = mm.iter().position(|&b| b == b';').ok_or(BaseModError::MissingTerminator)?;
+    let (entry, rest) = mm.split_at(sc);
+    // Skip the `;`.
+    let rest = rest.get(1..).unwrap_or(&[]);
+    Ok((entry, rest))
+}
+
+/// Parse a single MM entry and push resolved modifications into `pending`.
+#[allow(clippy::too_many_arguments, reason = "parser scratch state")]
+fn parse_entry(
+    entry: &[u8],
+    seq: &[Base],
+    is_reverse: bool,
+    ml: &[u8],
+    ml_cursor: &mut usize,
+    pending: &mut Vec<(u32, Modification)>,
+    state: &mut BaseModState,
+    bits: &mut TargetBits,
+) -> Result<(), BaseModError> {
+    // [BASE][STRAND][MOD_CODES][MODE]?(,DELTA)*
+    let canonical = parse_canonical_base(*entry.first().ok_or(BaseModError::MissingModCode)?)?;
+    let strand = parse_strand(*entry.get(1).ok_or(BaseModError::MissingModCode)?)?;
+    let body = entry.get(2..).unwrap_or(&[]);
+
+    let (mod_types, mode, deltas_bytes) = parse_body(body)?;
+
+    // Parse the delta list (zero or more comma-separated unsigned integers).
+    let deltas = parse_deltas(deltas_bytes)?;
+
+    // ML consumes `deltas.len() * mod_types.len()` values for this entry.
+    let total = deltas
+        .len()
+        .checked_mul(mod_types.len())
+        .ok_or(BaseModError::MlLengthMismatch { ml: ml.len(), mm: usize::MAX })?;
+    let ml_end = ml_cursor
+        .checked_add(total)
+        .ok_or(BaseModError::MlLengthMismatch { ml: ml.len(), mm: usize::MAX })?;
+    if ml_end > ml.len() {
+        return Err(BaseModError::MlLengthMismatch { ml: ml.len(), mm: ml_end });
+    }
+    #[allow(clippy::indexing_slicing, reason = "bounds checked immediately above")]
+    let ml_slice = &ml[*ml_cursor..ml_end];
+    *ml_cursor = ml_end;
+
+    // Resolve positions and emit Modifications.
+    resolve_and_emit(
+        canonical, strand, &mod_types, mode, &deltas, ml_slice, seq, is_reverse, pending, state,
+        bits,
+    )?;
+    Ok(())
+}
+
+fn parse_canonical_base(byte: u8) -> Result<Base, BaseModError> {
+    match byte | 0x20 {
+        b'a' => Ok(Base::A),
+        b'c' => Ok(Base::C),
+        b'g' => Ok(Base::G),
+        b't' => Ok(Base::T),
+        b'n' => Err(BaseModError::UnsupportedUnknownBase),
+        _ => Err(BaseModError::InvalidCanonicalBase(byte)),
+    }
+}
+
+fn parse_strand(byte: u8) -> Result<ModStrand, BaseModError> {
+    match byte {
+        b'+' => Ok(ModStrand::Plus),
+        b'-' => Ok(ModStrand::Minus),
+        other => Err(BaseModError::InvalidStrand(other)),
+    }
+}
+
+/// Parse the body of an entry after `[BASE][STRAND]`: mod codes, optional
+/// mode marker, and the `,`-prefixed delta list.
+///
+/// Returns `(mod_types, mode, remaining_bytes)` where remaining bytes include
+/// the leading comma (or are empty if no deltas follow).
+fn parse_body(body: &[u8]) -> Result<(Vec<ModType>, ModMode, &[u8]), BaseModError> {
+    let first = *body.first().ok_or(BaseModError::MissingModCode)?;
+    let (mod_types, after_codes) = if first.is_ascii_digit() {
+        // ChEBI numeric id: read digits.
+        let end = body.iter().position(|b| !b.is_ascii_digit()).unwrap_or(body.len());
+        #[allow(clippy::indexing_slicing, reason = "end <= body.len() by construction")]
+        let digits = &body[..end];
+        let s = std::str::from_utf8(digits).map_err(|_| BaseModError::InvalidChebi)?;
+        let id: u32 = s.parse().map_err(|_| BaseModError::InvalidChebi)?;
+        (vec![ModType::ChEBI(id)], body.get(end..).unwrap_or(&[]))
+    } else {
+        // One or more single-character codes.
+        let mut codes = Vec::new();
+        let mut i = 0;
+        while let Some(&b) = body.get(i) {
+            if matches!(b, b',' | b';' | b'.' | b'?') {
+                break;
+            }
+            if !b.is_ascii_alphabetic() {
+                return Err(BaseModError::InvalidModCode(b));
+            }
+            codes.push(ModType::Code(b));
+            i = i.saturating_add(1);
+        }
+        if codes.is_empty() {
+            return Err(BaseModError::MissingModCode);
+        }
+        (codes, body.get(i..).unwrap_or(&[]))
+    };
+
+    let (mode, remaining) = match after_codes.first() {
+        Some(b'.') => (ModMode::Unmodified, after_codes.get(1..).unwrap_or(&[])),
+        Some(b'?') => (ModMode::Ambiguous, after_codes.get(1..).unwrap_or(&[])),
+        _ => (ModMode::Implicit, after_codes),
+    };
+    Ok((mod_types, mode, remaining))
+}
+
+fn parse_deltas(bytes: &[u8]) -> Result<Vec<u32>, BaseModError> {
+    let mut out = Vec::new();
+    let mut rest = bytes;
+    while let Some((&first, tail)) = rest.split_first() {
+        if first != b',' {
+            return Err(BaseModError::InvalidDelta);
+        }
+        let end = tail.iter().position(|b| !b.is_ascii_digit()).unwrap_or(tail.len());
+        if end == 0 {
+            return Err(BaseModError::InvalidDelta);
+        }
+        #[allow(clippy::indexing_slicing, reason = "end > 0 and end <= tail.len()")]
+        let digits = &tail[..end];
+        let s = std::str::from_utf8(digits).map_err(|_| BaseModError::InvalidDelta)?;
+        let n: u32 = s.parse().map_err(|_| BaseModError::InvalidDelta)?;
+        out.push(n);
+        rest = tail.get(end..).unwrap_or(&[]);
+    }
+    Ok(out)
+}
+
+// r[impl base_mod.resolve_positions]
+// r[impl base_mod.reverse_complement]
+#[allow(clippy::too_many_arguments, reason = "per-entry resolution is a local helper")]
+fn resolve_and_emit(
+    canonical: Base,
+    strand: ModStrand,
+    mod_types: &[ModType],
+    mode: ModMode,
+    deltas: &[u32],
+    ml_slice: &[u8],
+    seq: &[Base],
+    is_reverse: bool,
+    pending: &mut Vec<(u32, Modification)>,
+    state: &mut BaseModState,
+    bits: &mut TargetBits,
+) -> Result<(), BaseModError> {
+    // Track the Unmodified flag per canonical base for is_unmodified().
+    if let Some(idx) = canonical.known_index()
+        && mode == ModMode::Unmodified
+    {
+        #[allow(clippy::indexing_slicing, reason = "known_index() returns Some(0..=3)")]
+        {
+            state.any_unmodified_mode[idx] = true;
+        }
+    }
+
+    if deltas.is_empty() {
+        return Ok(());
+    }
+
+    // Deltas count occurrences of the canonical base in the *original* read;
+    // a reverse read stores its reverse complement, so count the complement
+    // from the end of the stored sequence.
+    let target = if is_reverse { canonical.inverse() } else { canonical };
+    let words = bits.of(seq, target);
+    let mut walk = BitWalk::new(words, is_reverse);
+    let num_mods = mod_types.len();
+
+    for (delta_idx, &delta) in deltas.iter().enumerate() {
+        let Some(stored_idx) = walk.skip_then_take(delta) else {
+            return Err(BaseModError::DeltaOutOfRange { delta, base: canonical, is_reverse });
+        };
+        let qp = try_qpos(stored_idx, seq.len())?;
+        // Push one Modification per mod_type (combined codes interleaved in ML).
+        let base_offset = delta_idx
+            .checked_mul(num_mods)
+            .ok_or(BaseModError::MlLengthMismatch { ml: ml_slice.len(), mm: usize::MAX })?;
+        for (k, mt) in mod_types.iter().enumerate() {
+            let prob = base_offset
+                .checked_add(k)
+                .and_then(|i| ml_slice.get(i))
+                .ok_or(BaseModError::MlLengthMismatch { ml: ml_slice.len(), mm: usize::MAX })?;
+            pending.push((
+                qp,
+                Modification {
+                    mod_type: *mt,
+                    probability: ModProbability::from_byte(*prob),
+                    canonical_base: canonical,
+                    strand,
+                },
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One bit per stored base, set where the base is the entry's target: bit
+/// `i % 64` of word `i / 64`. Kept across the entries of one MM tag, so the
+/// usual `C+h?;C+m?;` pair scans the read once.
+#[derive(Default)]
+struct TargetBits {
+    target: Option<Base>,
+    words: Vec<u64>,
+}
+
+impl TargetBits {
+    fn of(&mut self, seq: &[Base], target: Base) -> &[u64] {
+        if self.target != Some(target) {
+            target_bits(Level::new(), bytemuck::cast_slice(seq), target as u8, &mut self.words);
+            self.target = Some(target);
+        }
+        &self.words
+    }
+}
+
+// r[impl io.simd_portable]
+fn target_bits(level: Level, seq: &[u8], target: u8, out: &mut Vec<u64>) {
+    out.clear();
+    out.reserve(seq.len().div_ceil(64));
+    dispatch!(level, simd => target_bits_simd(simd, seq, target, out));
+}
+
+/// Compare a native-width vector of bases against `target` per iteration and
+/// append the lane mask to the current 64-bit word. `S::u8s::LEN` (16, 32 or
+/// 64) divides 64, so a vector's mask never straddles two words; the tail
+/// that does not fill a vector is compared one byte at a time.
+#[simd]
+#[allow(
+    clippy::chunks_exact_to_as_chunks,
+    reason = "`S::u8s::LEN` depends on the generic `S`, so it cannot be a const argument"
+)]
+#[allow(
+    clippy::arithmetic_side_effects,
+    reason = "`shift` stays below 64: it steps by LEN, which divides 64, and resets at 64"
+)]
+fn target_bits_simd<S: Simd>(simd: S, seq: &[u8], target: u8, out: &mut Vec<u64>) {
+    let n = S::u8s::LEN;
+    let t = S::u8s::splat(simd, target);
+    let mut word = 0u64;
+    let mut shift = 0usize;
+    let mut chunks = seq.chunks_exact(n);
+    for c in &mut chunks {
+        word |= S::u8s::from_slice(simd, c).simd_eq(t).to_bitmask() << shift;
+        shift += n;
+        if shift == 64 {
+            out.push(word);
+            word = 0;
+            shift = 0;
+        }
+    }
+    for (i, &b) in chunks.remainder().iter().enumerate() {
+        word |= u64::from(b == target) << (shift + i);
+    }
+    if shift > 0 || !chunks.remainder().is_empty() {
+        out.push(word);
+    }
+}
+
+/// Walks the set bits of a [`TargetBits`] word list forward (from base 0) or
+/// backward (from the last base), `count_ones` skipping whole words.
+struct BitWalk<'a> {
+    words: &'a [u64],
+    /// Index of `cur` in `words`.
+    at: usize,
+    /// The bits of `words[at]` not yet walked past.
+    cur: u64,
+    backward: bool,
+}
+
+impl<'a> BitWalk<'a> {
+    fn new(words: &'a [u64], backward: bool) -> Self {
+        let at = if backward { words.len().saturating_sub(1) } else { 0 };
+        BitWalk { words, at, cur: words.get(at).copied().unwrap_or(0), backward }
+    }
+
+    /// Skip `n` set bits, then take the next one: the base index of the
+    /// `n + 1`-th target from the walk's position, or `None` when fewer
+    /// remain.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "cur != 0 whenever a bit is cleared or its index taken; at * 64 + bit indexes a base"
+    )]
+    fn skip_then_take(&mut self, mut n: u32) -> Option<usize> {
+        loop {
+            let ones = self.cur.count_ones();
+            if n < ones {
+                for _ in 0..n {
+                    self.cur &= !self.next_bit();
+                }
+                let bit = self.next_bit();
+                self.cur &= !bit;
+                return Some(self.at * 64 + bit.trailing_zeros() as usize);
+            }
+            n -= ones;
+            if self.backward {
+                self.at = self.at.checked_sub(1)?;
+            } else {
+                self.at += 1;
+            }
+            self.cur = *self.words.get(self.at)?;
+        }
+    }
+
+    /// The next bit of `cur` in walk order, as a one-bit mask. `cur != 0`.
+    #[allow(clippy::arithmetic_side_effects, reason = "cur != 0, so leading_zeros < 64")]
+    fn next_bit(&self) -> u64 {
+        if self.backward {
+            1 << (63 - self.cur.leading_zeros())
+        } else {
+            self.cur & self.cur.wrapping_neg()
+        }
+    }
+}
+
+/// Convert a stored-sequence index into the `u32` we keep in `qpos`.
+///
+/// Defense in depth: callers already maintain `stored_idx < seq_len`, but
+/// `seq_len` itself comes from untrusted input. A >4 GiB sequence would
+/// silently truncate the cast — surface it as a typed error instead.
+///
+/// Pulled out as a standalone function so the failure path can be exercised
+/// without allocating a 4 GiB `Vec<Base>`; see `try_qpos_rejects_overflow`.
+fn try_qpos(stored_idx: usize, seq_len: usize) -> Result<u32, BaseModError> {
+    u32::try_from(stored_idx).map_err(|_| BaseModError::SeqTooLong { len: seq_len })
+}
+
+// TODO(pileup-integration): once `PileupColumn::modification_at` is added
+// (see spec `r[base_mod.pileup_integration]`), the pileup engine needs a
+// lazy per-active-record cache of `BaseModState`. The natural shape is a
+// side-table parallel to `active` indexed by alignment_idx, to keep
+// `ActiveRecord` lean (hot loop only touches `active_end_pos`).
+
+#[cfg(test)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    reason = "test code"
+)]
+mod tests {
+    use super::*;
+    use crate::bam::MateFields;
+    use crate::bam::record_idx::RecordIdx;
+    use crate::bam::test_util::tid;
+    use seqair_types::Base::{A, C, G, T};
+
+    fn seq(bases: &[Base]) -> Vec<Base> {
+        bases.to_vec()
+    }
+
+    // r[verify base_mod.parse_mm]
+    // r[verify base_mod.state]
+    // r[verify base_mod.modification_struct]
+    // r[verify base_mod.query_qpos]
+    #[test]
+    fn parses_simple_cpg_entry() {
+        // Sequence: ACGT ACGC GACG T  (positions of C: 1, 5, 7, 10)
+        let s = seq(&[A, C, G, T, A, C, G, C, G, A, C, G, T]);
+        let state = BaseModState::parse(b"C+m,0,2;", &[200, 180], &s, false).unwrap();
+        assert_eq!(state.len(), 2);
+        // First C is at qpos 1; after skipping 2 C's (5, 7), next is at 10.
+        let m1 = state.mod_at_qpos(QPos::new(1)).unwrap();
+        assert_eq!(m1.len(), 1);
+        assert_eq!(m1[0].probability, ModProbability::from_byte(200));
+        assert!(matches!(m1[0].mod_type, ModType::Code(b'm')));
+        assert_eq!(m1[0].canonical_base, C);
+        assert!(matches!(m1[0].strand, ModStrand::Plus));
+
+        let m2 = state.mod_at_qpos(QPos::new(10)).unwrap();
+        assert_eq!(m2[0].probability, ModProbability::from_byte(180));
+    }
+
+    // r[verify base_mod.resolve_positions]
+    #[test]
+    fn delta_zero_is_first_occurrence() {
+        let s = seq(&[A, C, C, C]);
+        let state = BaseModState::parse(b"C+m,0;", &[128], &s, false).unwrap();
+        assert_eq!(
+            state.mod_at_qpos(QPos::new(1)).unwrap()[0].probability,
+            ModProbability::from_byte(128)
+        );
+        assert!(state.mod_at_qpos(QPos::new(0)).is_none());
+        assert!(state.mod_at_qpos(QPos::new(2)).is_none());
+    }
+
+    // r[verify base_mod.reverse_complement]
+    #[test]
+    fn reverse_strand_uses_complement_counting_from_end() {
+        // Original 5'→3': ACGT ACG (C at original pos 1 and 5)
+        // Stored (reverse-complemented): CGT ACGT (G at stored 0 and 4)
+        // Original: A(0) C(1) G(2) T(3) A(4) C(5) G(6)
+        // Reverse complement: complement each base, then reverse.
+        // complement: T G C A T G C
+        // reverse:    C G T A C G T
+        // So stored is: C G T A C G T (length 7)
+        // G occurrences in stored (from end): pos 5, pos 1
+        // The original 0th C (original pos 1) should map to stored pos 5 (the
+        // last-from-start, first-from-end G). The original 1st C (original
+        // pos 5) should map to stored pos 1.
+        let stored = seq(&[C, G, T, A, C, G, T]);
+        let state = BaseModState::parse(b"C+m,0,0;", &[200, 210], &stored, true).unwrap();
+        let m_first = state.mod_at_qpos(QPos::new(5)).unwrap();
+        assert_eq!(m_first[0].probability, ModProbability::from_byte(200));
+        let m_second = state.mod_at_qpos(QPos::new(1)).unwrap();
+        assert_eq!(m_second[0].probability, ModProbability::from_byte(210));
+    }
+
+    // r[verify base_mod.parse_mm]
+    #[test]
+    fn parses_multiple_entries() {
+        let s = seq(&[A, C, G, C, G, A, C, G]);
+        let state = BaseModState::parse(b"C+m,0;C+h,1;", &[200, 150], &s, false).unwrap();
+        // m on the 0th C (qpos 1); h on the 1st C (qpos 3) after skipping 1.
+        assert!(matches!(
+            state.mod_at_qpos(QPos::new(1)).unwrap()[0].mod_type,
+            ModType::Code(b'm')
+        ));
+        assert!(matches!(
+            state.mod_at_qpos(QPos::new(3)).unwrap()[0].mod_type,
+            ModType::Code(b'h')
+        ));
+    }
+
+    // r[verify base_mod.parse_mm]
+    #[test]
+    fn combined_codes_interleave_ml() {
+        // `C+mh,0,2;` with ML = [m0, h0, m1, h1]
+        // 4 C's at qpos 1, 3, 5, 7. delta 0 → C@1; delta 2 → skip 2 more (3,5) → C@7.
+        let s = seq(&[A, C, A, C, A, C, A, C]);
+        let state = BaseModState::parse(b"C+mh,0,2;", &[200, 100, 220, 120], &s, false).unwrap();
+        let at1 = state.mod_at_qpos(QPos::new(1)).unwrap();
+        assert_eq!(at1.len(), 2);
+        assert!(matches!(at1[0].mod_type, ModType::Code(b'm')));
+        assert_eq!(at1[0].probability, ModProbability::from_byte(200));
+        assert!(matches!(at1[1].mod_type, ModType::Code(b'h')));
+        assert_eq!(at1[1].probability, ModProbability::from_byte(100));
+        let at7 = state.mod_at_qpos(QPos::new(7)).unwrap();
+        assert_eq!(at7.len(), 2);
+        assert_eq!(at7[0].probability, ModProbability::from_byte(220));
+        assert_eq!(at7[1].probability, ModProbability::from_byte(120));
+    }
+
+    // r[verify base_mod.parse_mm]
+    #[test]
+    fn parses_chebi_code() {
+        let s = seq(&[A, C, G, T]);
+        let state = BaseModState::parse(b"C+27551,0;", &[200], &s, false).unwrap();
+        assert!(matches!(
+            state.mod_at_qpos(QPos::new(1)).unwrap()[0].mod_type,
+            ModType::ChEBI(27551)
+        ));
+    }
+
+    // r[verify base_mod.implicit_explicit]
+    /// Document the per-canonical-base scope of `is_unmodified`. When two
+    /// entries share the same canonical base but use different modes (e.g.
+    /// `C+m.,…;C+h,…;`), `is_unmodified(qpos, C)` returns `Some(true)` for an
+    /// unlisted position because at least one entry is `Unmodified`. This is
+    /// correct *only* with respect to the modification types listed in the
+    /// `Unmodified`-mode entries (here: 5mC). The status of the
+    /// `Implicit`-mode entries (here: 5hmC) at the same position remains
+    /// unknown. Callers needing per-mod-type semantics must inspect the
+    /// returned `Modification` slice directly.
+    #[test]
+    fn is_unmodified_mixed_mode_same_canonical_is_per_canonical() {
+        // 4 C's at qpos 1, 3, 5, 7.
+        let s = seq(&[A, C, A, C, A, C, A, C]);
+        // C+m. lists C@1 only (5mC at C0 of the C run); 5mC at unlisted C's
+        // is definitively absent. C+h (implicit) lists C@3 only; 5hmC at
+        // unlisted C's is unknown.
+        let state = BaseModState::parse(b"C+m.,0;C+h,1;", &[200, 150], &s, false).unwrap();
+        // Position 1 has a 5mC call — Some(false).
+        assert_eq!(state.is_unmodified(QPos::new(1), C), Some(false));
+        // Position 3 has a 5hmC call — Some(false).
+        assert_eq!(state.is_unmodified(QPos::new(3), C), Some(false));
+        // Position 5 has neither call. Per the spec: because at least one
+        // C-entry is `Unmodified`, this returns `Some(true)`. The contract
+        // is "no Unmodified-mode modification of this canonical base at qpos",
+        // NOT "no modification of any kind at qpos".
+        assert_eq!(
+            state.is_unmodified(QPos::new(5), C),
+            Some(true),
+            "is_unmodified is per-canonical-base, not per-mod-type"
+        );
+    }
+
+    // r[verify base_mod.implicit_explicit]
+    #[test]
+    fn is_unmodified_three_modes() {
+        let s = seq(&[A, C, G, C, G, C]);
+
+        // Implicit mode: unlisted positions are unknown.
+        let implicit = BaseModState::parse(b"C+m,0;", &[200], &s, false).unwrap();
+        assert_eq!(implicit.is_unmodified(QPos::new(1), C), Some(false));
+        assert_eq!(implicit.is_unmodified(QPos::new(3), C), None);
+
+        // Explicit `.`: unlisted positions are definitively unmodified.
+        let explicit = BaseModState::parse(b"C+m.,0;", &[200], &s, false).unwrap();
+        assert_eq!(explicit.is_unmodified(QPos::new(1), C), Some(false));
+        assert_eq!(explicit.is_unmodified(QPos::new(3), C), Some(true));
+
+        // Ambiguous `?`: same observable behavior as Implicit.
+        let ambiguous = BaseModState::parse(b"C+m?,0;", &[200], &s, false).unwrap();
+        assert_eq!(ambiguous.is_unmodified(QPos::new(3), C), None);
+    }
+
+    // r[verify base_mod.query_refpos]
+    #[test]
+    fn query_refpos_via_cigar() {
+        use super::super::cigar::{CigarMapping, CigarOp, CigarOpType};
+        use seqair_types::Pos0;
+
+        // Read starts at ref 1000, 10M. C's at qpos 1, 3 → ref 1001, 1003.
+        let s = seq(&[A, C, G, C, G, A, C, G, T, A]);
+        let state = BaseModState::parse(b"C+m,0,0;", &[200, 180], &s, false).unwrap();
+
+        // Build a simple 10M CIGAR.
+        let cigar = [CigarOp::new(CigarOpType::Match, 10)];
+        let cm = CigarMapping::new(Pos0::new(1000).unwrap(), &cigar).unwrap();
+
+        let m = state.mod_at_ref_pos(Pos0::new(1001).unwrap(), &cm).unwrap();
+        assert_eq!(m[0].probability, ModProbability::from_byte(200));
+        let m2 = state.mod_at_ref_pos(Pos0::new(1003).unwrap(), &cm).unwrap();
+        assert_eq!(m2[0].probability, ModProbability::from_byte(180));
+        assert!(state.mod_at_ref_pos(Pos0::new(1002).unwrap(), &cm).is_none());
+    }
+
+    // r[verify base_mod.validation]
+    #[test]
+    fn validation_ml_length_mismatch() {
+        let s = seq(&[A, C, G]);
+        let err = BaseModState::parse(b"C+m,0;", &[200, 180], &s, false).unwrap_err();
+        assert!(matches!(err, BaseModError::MlLengthMismatch { .. }), "got {err:?}");
+    }
+
+    // r[verify base_mod.validation]
+    #[test]
+    fn validation_missing_terminator() {
+        let s = seq(&[A, C, G]);
+        let err = BaseModState::parse(b"C+m,0", &[200], &s, false).unwrap_err();
+        assert!(matches!(err, BaseModError::MissingTerminator), "got {err:?}");
+    }
+
+    // r[verify base_mod.validation]
+    #[test]
+    fn validation_delta_out_of_range() {
+        let s = seq(&[A, C]); // only 1 C
+        let err = BaseModState::parse(b"C+m,5;", &[200], &s, false).unwrap_err();
+        assert!(matches!(err, BaseModError::DeltaOutOfRange { .. }), "got {err:?}");
+    }
+
+    // r[verify base_mod.validation]
+    #[test]
+    fn validation_bad_canonical() {
+        let s = seq(&[A, C, G]);
+        let err = BaseModState::parse(b"Z+m,0;", &[200], &s, false).unwrap_err();
+        assert!(matches!(err, BaseModError::InvalidCanonicalBase(_)), "got {err:?}");
+    }
+
+    // r[verify base_mod.validation]
+    #[test]
+    fn validation_bad_strand() {
+        let s = seq(&[A, C, G]);
+        let err = BaseModState::parse(b"C*m,0;", &[200], &s, false).unwrap_err();
+        assert!(matches!(err, BaseModError::InvalidStrand(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn empty_mm_empty_ml_ok() {
+        let s = seq(&[A, C, G]);
+        let state = BaseModState::parse(b"", &[], &s, false).unwrap();
+        assert!(state.is_empty());
+        assert!(state.mod_at_qpos(QPos::new(1)).is_none());
+        assert_eq!(state.is_unmodified(QPos::new(1), C), None);
+    }
+
+    #[test]
+    fn trailing_nul_tolerated() {
+        let s = seq(&[A, C, G]);
+        let state = BaseModState::parse(b"C+m,0;\0", &[200], &s, false).unwrap();
+        assert_eq!(state.len(), 1);
+    }
+
+    #[test]
+    fn strand_minus_parses() {
+        let s = seq(&[A, C, G]);
+        let state = BaseModState::parse(b"C-m,0;", &[200], &s, false).unwrap();
+        assert!(matches!(state.mod_at_qpos(QPos::new(1)).unwrap()[0].strand, ModStrand::Minus));
+    }
+
+    #[test]
+    fn lowercase_canonical_base() {
+        let s = seq(&[A, C, G]);
+        let state = BaseModState::parse(b"c+m,0;", &[200], &s, false).unwrap();
+        assert_eq!(state.mod_at_qpos(QPos::new(1)).unwrap()[0].canonical_base, C);
+    }
+
+    #[test]
+    fn two_entries_same_canonical_sort_by_qpos() {
+        // Second entry's first hit is earlier than first entry's first hit.
+        let s = seq(&[A, C, G, C, G, C]);
+        // C+m,2 → skip 2 C's → C@5. C+h,0 → C@1.
+        let state = BaseModState::parse(b"C+m,2;C+h,0;", &[200, 100], &s, false).unwrap();
+        assert!(matches!(
+            state.mod_at_qpos(QPos::new(1)).unwrap()[0].mod_type,
+            ModType::Code(b'h')
+        ));
+        assert!(matches!(
+            state.mod_at_qpos(QPos::new(5)).unwrap()[0].mod_type,
+            ModType::Code(b'm')
+        ));
+    }
+
+    // r[verify base_mod.validation]
+    #[test]
+    fn validation_invalid_delta_empty() {
+        let s = seq(&[A, C, G]);
+        // ',' followed immediately by terminator — `,;` — empty delta digits.
+        let err = BaseModState::parse(b"C+m,;", &[], &s, false).unwrap_err();
+        assert!(matches!(err, BaseModError::InvalidDelta), "got {err:?}");
+    }
+
+    // r[verify base_mod.validation]
+    #[test]
+    fn validation_missing_mod_code_empty_body() {
+        let s = seq(&[A, C, G]);
+        // BASE+STRAND followed immediately by ';' — body is empty.
+        let err = BaseModState::parse(b"C+;", &[], &s, false).unwrap_err();
+        assert!(matches!(err, BaseModError::MissingModCode), "got {err:?}");
+    }
+
+    // r[verify base_mod.validation]
+    #[test]
+    fn validation_missing_mod_code_only_delimiter() {
+        let s = seq(&[A, C, G]);
+        // BASE+STRAND, then ',' — body is `,…` which yields zero codes.
+        let err = BaseModState::parse(b"C+,0;", &[200], &s, false).unwrap_err();
+        assert!(matches!(err, BaseModError::MissingModCode), "got {err:?}");
+    }
+
+    #[test]
+    fn try_qpos_accepts_in_range_indices() {
+        assert_eq!(try_qpos(0, 1).unwrap(), 0);
+        assert_eq!(try_qpos(u32::MAX as usize, u32::MAX as usize + 1).unwrap(), u32::MAX);
+    }
+
+    // ---------------- from_record (high-level constructor) ----------------
+
+    use crate::bam::aux_data::AuxData;
+    use crate::bam::record_store::RecordStore;
+    use seqair_types::{BamFlags, MappingQuality, Pos0};
+
+    /// Push a forward-strand record with the given bases and aux bytes.
+    /// Returns the populated `RecordStore` and the record index.
+    fn push_record(bases: &[Base], aux: &[u8]) -> (RecordStore<()>, RecordIdx) {
+        let mut store: RecordStore<()> = RecordStore::new();
+        let pos = Pos0::new(100).unwrap();
+        let qual = vec![30u8; bases.len()];
+        let idx = store
+            .push_fields(
+                pos,
+                pos,
+                BamFlags::empty(),
+                MappingQuality::from_byte(30),
+                bases.len() as u32,
+                0,
+                b"r1",
+                &[],
+                bases,
+                &qual,
+                aux,
+                Some(tid(0)),
+                MateFields::default(),
+                &mut (),
+            )
+            .unwrap()
+            .unwrap();
+        (store, idx)
+    }
+
+    #[test]
+    fn from_record_with_mm_and_ml_returns_some() {
+        let bases = vec![A, C, G, T, A, C, G, C, G, A, C, G, T];
+        let mut aux = AuxData::new();
+        aux.set_string(*b"MM", b"C+m,0,2;");
+        aux.set_array_u8(*b"ML", &[200, 180]).unwrap();
+
+        let (store, idx) = push_record(&bases, aux.as_bytes());
+        let rec = store.record(idx).unwrap();
+        let rec = rec.slim();
+
+        let from_rec =
+            BaseModState::from_record(rec, &store).unwrap().expect("MM tag present, expected Some");
+        let expected = BaseModState::parse(b"C+m,0,2;", &[200, 180], &bases, false).unwrap();
+
+        assert_eq!(from_rec.len(), expected.len());
+        let m_from = from_rec.mod_at_qpos(QPos::new(1)).unwrap();
+        let m_exp = expected.mod_at_qpos(QPos::new(1)).unwrap();
+        assert_eq!(m_from.len(), m_exp.len());
+        assert_eq!(m_from[0].probability, m_exp[0].probability);
+        assert_eq!(m_from[0].canonical_base, m_exp[0].canonical_base);
+    }
+
+    #[test]
+    fn from_record_with_mm_only_uses_empty_ml() {
+        // MM with a single delta of 0 needs one ML byte. Without ML, parse
+        // sees ml=&[] and the length-mismatch validation fires.
+        let bases = vec![A, C, G];
+        let mut aux = AuxData::new();
+        aux.set_string(*b"MM", b"C+m,0;");
+        // No ML set.
+
+        let (store, idx) = push_record(&bases, aux.as_bytes());
+        let rec = store.record(idx).unwrap();
+        let rec = rec.slim();
+
+        let err = BaseModState::from_record(rec, &store).unwrap_err();
+        assert!(
+            matches!(err, FromRecordError::Parse(BaseModError::MlLengthMismatch { .. })),
+            "got {err:?}"
+        );
+
+        // Empty MM (no deltas) is fine with no ML.
+        let mut aux2 = AuxData::new();
+        aux2.set_string(*b"MM", b"C+m;");
+        let (store2, idx2) = push_record(&bases, aux2.as_bytes());
+        let rec2 = store2.record(idx2).unwrap();
+        let rec2 = rec2.slim();
+        let state = BaseModState::from_record(rec2, &store2).unwrap().expect("MM present");
+        assert!(state.is_empty());
+    }
+
+    #[test]
+    fn from_record_without_mm_returns_none() {
+        let bases = vec![A, C, G];
+        let mut aux = AuxData::new();
+        // Some unrelated tag, but no MM.
+        aux.set_string(*b"RG", b"grp1");
+
+        let (store, idx) = push_record(&bases, aux.as_bytes());
+        let rec = store.record(idx).unwrap();
+        let rec = rec.slim();
+
+        let state = BaseModState::from_record(rec, &store).unwrap();
+        assert!(state.is_none(), "expected None when MM absent, got Some");
+    }
+
+    #[test]
+    fn from_record_with_malformed_mm_returns_err() {
+        // `C+m,0` — missing terminating ';' — propagates as Parse(MissingTerminator).
+        let bases = vec![A, C, G];
+        let mut aux = AuxData::new();
+        aux.set_string(*b"MM", b"C+m,0");
+        aux.set_array_u8(*b"ML", &[200]).unwrap();
+
+        let (store, idx) = push_record(&bases, aux.as_bytes());
+        let rec = store.record(idx).unwrap();
+        let rec = rec.slim();
+
+        let err = BaseModState::from_record(rec, &store).unwrap_err();
+        assert!(
+            matches!(err, FromRecordError::Parse(BaseModError::MissingTerminator)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn from_record_with_wrong_mm_type_returns_err() {
+        // MM as an integer instead of a Z-string.
+        let bases = vec![A, C, G];
+        let mut aux = AuxData::new();
+        aux.set_int(*b"MM", 42).unwrap();
+
+        let (store, idx) = push_record(&bases, aux.as_bytes());
+        let rec = store.record(idx).unwrap();
+        let rec = rec.slim();
+
+        let err = BaseModState::from_record(rec, &store).unwrap_err();
+        assert!(matches!(err, FromRecordError::BadMmTag(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn from_record_with_wrong_ml_type_returns_err() {
+        // ML as a B:S array instead of B:C.
+        let bases = vec![A, C, G];
+        let mut aux = AuxData::new();
+        aux.set_string(*b"MM", b"C+m,0;");
+        aux.set_array_u16(*b"ML", &[200]).unwrap();
+
+        let (store, idx) = push_record(&bases, aux.as_bytes());
+        let rec = store.record(idx).unwrap();
+        let rec = rec.slim();
+
+        let err = BaseModState::from_record(rec, &store).unwrap_err();
+        assert!(matches!(err, FromRecordError::BadMlTag { got: "B:S" }), "got {err:?}");
+    }
+
+    #[test]
+    fn from_record_reverse_strand_uses_complement() {
+        // Same fixture as `reverse_strand_uses_complement_counting_from_end`,
+        // but driven through from_record with the reverse flag.
+        let bases = vec![C, G, T, A, C, G, T];
+        let mut aux = AuxData::new();
+        aux.set_string(*b"MM", b"C+m,0,0;");
+        aux.set_array_u8(*b"ML", &[200, 210]).unwrap();
+
+        let mut store: RecordStore<()> = RecordStore::new();
+        let pos = Pos0::new(100).unwrap();
+        let qual = vec![30u8; bases.len()];
+        let mut flags = BamFlags::empty();
+        flags.set(seqair_types::bam_flags::consts::FLAG_REVERSE);
+        let idx = store
+            .push_fields(
+                pos,
+                pos,
+                flags,
+                MappingQuality::from_byte(30),
+                bases.len() as u32,
+                0,
+                b"r1",
+                &[],
+                &bases,
+                &qual,
+                aux.as_bytes(),
+                Some(tid(0)),
+                MateFields::default(),
+                &mut (),
+            )
+            .unwrap()
+            .unwrap();
+
+        let rec = store.record(idx).unwrap();
+        let rec = rec.slim();
+        let state = BaseModState::from_record(rec, &store).unwrap().expect("MM present");
+        assert_eq!(
+            state.mod_at_qpos(QPos::new(5)).unwrap()[0].probability,
+            ModProbability::from_byte(200)
+        );
+        assert_eq!(
+            state.mod_at_qpos(QPos::new(1)).unwrap()[0].probability,
+            ModProbability::from_byte(210)
+        );
+    }
+
+    // ---------------- oracles for the validation paths ----------------
+
+    use hegel::prelude::*;
+
+    // r[verify base_mod.validation]
+    /// Any byte that decodes (case-folded) to `n` MUST yield
+    /// `UnsupportedUnknownBase`, not `InvalidCanonicalBase` and not a panic.
+    /// Only `b'N'` and `b'n'` satisfy `byte | 0x20 == b'n'`, but the parser
+    /// reaches that branch via the same `byte | 0x20` mask, so testing both
+    /// covers the case-insensitive contract.
+    #[hegel::test]
+    fn n_canonical_rejected(tc: TestCase) {
+        let case = tc.draw(gs::sampled_from(&b"Nn"[..]));
+        let s = seq(&[A, C, G]);
+        let mm = [case, b'+', b'm', b',', b'0', b';'];
+        let err = BaseModState::parse(&mm, &[200], &s, false).unwrap_err();
+        assert!(matches!(err, BaseModError::UnsupportedUnknownBase), "got {err:?}");
+    }
+
+    // r[verify base_mod.validation]
+    /// Any non-ACGTN ASCII byte at the canonical-base position MUST yield
+    /// `InvalidCanonicalBase(byte)`. Excludes ACGT/acgt and N/n; also
+    /// excludes `;` because it terminates the entry early (the parser then
+    /// sees the *next* byte as the canonical base, exercising a different
+    /// path than this property is meant to cover).
+    #[hegel::test]
+    fn invalid_canonical_base_byte(tc: TestCase) {
+        let byte = tc.draw(
+            gs::integers::<u8>()
+                .filter(|b| !matches!(b | 0x20, b'a' | b'c' | b'g' | b't' | b'n') && *b != b';'),
+        );
+        let s = seq(&[A, C, G]);
+        let mm = [byte, b'+', b'm', b',', b'0', b';'];
+        let err = BaseModState::parse(&mm, &[200], &s, false).unwrap_err();
+        assert!(
+            matches!(err, BaseModError::InvalidCanonicalBase(b) if b == byte),
+            "expected InvalidCanonicalBase({byte:#x}), got {err:?}",
+        );
+    }
+
+    // r[verify base_mod.validation]
+    /// Any non-alpha, non-delimiter, non-digit byte appearing where a mod
+    /// code is expected (after `BASE+STRAND`) MUST yield `InvalidModCode`.
+    /// Digits trigger the `ChEBI` branch; `,`, `;`, `.`, `?` are delimiters;
+    /// alphabetic bytes are valid single-char codes.
+    #[hegel::test]
+    fn invalid_mod_code_byte(tc: TestCase) {
+        let byte = tc.draw(gs::integers::<u8>().filter(|b| {
+            !b.is_ascii_alphabetic()
+                && !b.is_ascii_digit()
+                && !matches!(*b, b',' | b';' | b'.' | b'?')
+        }));
+        let s = seq(&[A, C, G]);
+        let mm = [b'C', b'+', byte, b',', b'0', b';'];
+        let err = BaseModState::parse(&mm, &[200], &s, false).unwrap_err();
+        assert!(
+            matches!(err, BaseModError::InvalidModCode(b) if b == byte),
+            "expected InvalidModCode({byte:#x}), got {err:?}",
+        );
+    }
+
+    // r[verify base_mod.validation]
+    /// A non-digit byte in the delta position (right after `,`) MUST yield
+    /// `InvalidDelta`. `;` is excluded because it terminates the entry
+    /// before the delta parser sees it (the empty-delta case is covered by
+    /// `validation_invalid_delta_empty`).
+    #[hegel::test]
+    fn invalid_delta_non_numeric(tc: TestCase) {
+        let byte = tc.draw(gs::integers::<u8>().filter(|b| !b.is_ascii_digit() && *b != b';'));
+        let s = seq(&[A, C, G]);
+        let mm = [b'C', b'+', b'm', b',', byte, b';'];
+        let err = BaseModState::parse(&mm, &[200], &s, false).unwrap_err();
+        assert!(matches!(err, BaseModError::InvalidDelta), "got {err:?}");
+    }
+
+    // r[verify base_mod.validation]
+    /// `try_qpos` MUST reject `stored_idx > u32::MAX` with `SeqTooLong`,
+    /// where `seq_len` is the length the caller would have observed when
+    /// the cast failed. We exercise this directly because allocating a
+    /// >4 GiB `Vec<Base>` to drive `parse` is impractical. Gated to 64-bit
+    /// targets — on 32-bit `usize <= u32::MAX` so the failure path is
+    /// unreachable and `usize as u64 + 1` may overflow the value range.
+    #[cfg(target_pointer_width = "64")]
+    #[hegel::test]
+    fn try_qpos_rejects_overflow(tc: TestCase) {
+        // `stored_idx > u32::MAX` and `seq_len >= stored_idx + 1`.
+        let stored_idx = tc.draw(
+            gs::integers::<u64>()
+                .min_value(u64::from(u32::MAX) + 1)
+                .max_value(u64::from(u32::MAX) + 1_000_000),
+        );
+        let extra = tc.draw(gs::integers::<u64>().max_value(1_000_000));
+        let seq_len = (stored_idx + extra) as usize;
+        let stored_idx = stored_idx as usize;
+        match try_qpos(stored_idx, seq_len) {
+            Err(BaseModError::SeqTooLong { len }) => assert_eq!(len, seq_len),
+            other => panic!("expected SeqTooLong, got {other:?}"),
+        }
+    }
+
+    // r[verify base_mod.parse_mm]
+    /// Any decimal `ChEBI` id that exceeds `u32::MAX` MUST be rejected with
+    /// `InvalidChebi`. `str::parse::<u32>` returns `Err` for the entire
+    /// `(u32::MAX as u64 + 1)..=u64::MAX` range, so generating a `u64` in
+    /// that range covers the overflow contract.
+    #[hegel::test]
+    fn chebi_overflow_rejected(tc: TestCase) {
+        let id = tc.draw(gs::integers::<u64>().min_value(u64::from(u32::MAX) + 1));
+        let s = seq(&[A, C, G]);
+        let mut mm: Vec<u8> = b"C+".to_vec();
+        mm.extend_from_slice(id.to_string().as_bytes());
+        mm.extend_from_slice(b",0;");
+        let err = BaseModState::parse(&mm, &[200], &s, false).unwrap_err();
+        assert!(matches!(err, BaseModError::InvalidChebi), "got {err:?}");
+    }
+
+    // ---------------- target bitmask kernel and walk ----------------
+
+    // r[verify io.simd_portable]
+    /// Every SIMD level builds the same bitmask as comparing one byte at a
+    /// time. The alphabet is small so targets are dense, and lengths cross
+    /// several vector widths and 64-bit words.
+    #[hegel::test]
+    fn target_bits_every_level_matches_bytewise(tc: TestCase) {
+        let seq: Vec<u8> = tc.draw(gs::vecs(gs::sampled_from(&b"ACGTN"[..])).max_size(300));
+        let target = tc.draw(gs::sampled_from(&b"ACGTN"[..]));
+        let mut expected = vec![0u64; seq.len().div_ceil(64)];
+        for (i, &b) in seq.iter().enumerate() {
+            if b == target {
+                expected[i / 64] |= 1 << (i % 64);
+            }
+        }
+        for level in crate::simd_levels::levels() {
+            let mut out = vec![u64::MAX; 3]; // stale contents must not survive
+            target_bits(level, &seq, target, &mut out);
+            assert_eq!(out, expected, "{level:?}, len={}", seq.len());
+        }
+    }
+
+    // r[verify base_mod.resolve_positions]
+    // r[verify base_mod.reverse_complement]
+    /// Deltas built by picking a subset of the canonical base's occurrences
+    /// resolve to exactly those occurrences: listed in the original read's
+    /// order, which for a reverse read is the stored complement read from
+    /// the end. A `C+h?;C+m?;G+o?;` tag exercises the reuse of one bitmask
+    /// across entries and its replacement when the target changes. An extra
+    /// delta past the last occurrence must fail with `DeltaOutOfRange`.
+    #[hegel::test]
+    fn resolved_positions_match_occurrence_oracle(tc: TestCase) {
+        use std::fmt::Write as _;
+        let seq: Vec<Base> = tc
+            .draw(gs::vecs(gs::integers::<u8>().max_value(4)).max_size(300))
+            .into_iter()
+            .map(|i| [A, C, G, T, Base::Unknown][usize::from(i)])
+            .collect();
+        let is_reverse = tc.draw(gs::booleans());
+        let overflow = tc.draw(gs::booleans());
+
+        // Occurrences of `canonical` in original-read order, as stored indices.
+        let occurrences = |canonical: Base| -> Vec<usize> {
+            let target = if is_reverse { canonical.inverse() } else { canonical };
+            let hits = seq.iter().enumerate().filter(|(_, b)| **b == target).map(|(i, _)| i);
+            if is_reverse { hits.rev().collect() } else { hits.collect() }
+        };
+        let picks = |canonical: Base| -> (Vec<usize>, String) {
+            let occ = occurrences(canonical);
+            let chosen: Vec<bool> =
+                tc.draw(gs::vecs(gs::booleans()).min_size(occ.len()).max_size(occ.len()));
+            let (mut list, mut skipped, mut picked) = (String::new(), 0u32, Vec::new());
+            for (&i, &c) in occ.iter().zip(&chosen) {
+                if c {
+                    write!(list, ",{skipped}").unwrap();
+                    picked.push(i);
+                    skipped = 0;
+                } else {
+                    skipped += 1;
+                }
+            }
+            (picked, list)
+        };
+        let (c_picked, c_list) = picks(C);
+        let (g_picked, mut g_list) = picks(G);
+        if overflow {
+            write!(g_list, ",{}", occurrences(G).len()).unwrap();
+        }
+        let mm = format!("C+h?{c_list};C+m?{c_list};G+o?{g_list};");
+        let n_ml = 2 * c_picked.len() + g_picked.len() + usize::from(overflow);
+        let ml: Vec<u8> = (0..n_ml).map(|i| i as u8).collect();
+
+        let result = BaseModState::parse(mm.as_bytes(), &ml, &seq, is_reverse);
+        if overflow {
+            assert!(
+                matches!(result, Err(BaseModError::DeltaOutOfRange { base: G, .. })),
+                "{result:?}"
+            );
+            return;
+        }
+        let state = result.unwrap();
+        let mut expected: Vec<(u32, u8)> = Vec::new();
+        let n_c = c_picked.len();
+        for (k, &i) in c_picked.iter().enumerate() {
+            expected.push((i as u32, k as u8));
+        }
+        for (k, &i) in c_picked.iter().enumerate() {
+            expected.push((i as u32, (n_c + k) as u8));
+        }
+        for (k, &i) in g_picked.iter().enumerate() {
+            expected.push((i as u32, (2 * n_c + k) as u8));
+        }
+        expected.sort_by_key(|&(q, _)| q); // stable: same-qpos order is entry order
+        let got: Vec<(u32, u8)> = state
+            .qpos
+            .iter()
+            .zip(&state.mods)
+            .map(|(&q, m)| (q, m.probability.as_byte()))
+            .collect();
+        assert_eq!(got, expected);
+    }
+}

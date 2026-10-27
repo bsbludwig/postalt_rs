@@ -1,0 +1,1421 @@
+//! Format-agnostic record encoder with typed field keys.
+//!
+//! Typed field keys ([`InfoKey`], [`FormatKey`]) enforce value types at compile
+//! time. The [`InfoEncoder`] and [`FormatEncoder`] traits provide object-safe
+//! APIs for encoding INFO and FORMAT fields into either BCF binary or VCF text.
+//!
+//! # Field definitions
+//!
+//! [`InfoFieldDef`] and [`FormatFieldDef`] combine header metadata with
+//! type-safe key resolution. Register them on [`VcfHeaderBuilder`](super::header::VcfHeaderBuilder)
+//! to build the header and resolve keys in one step:
+//!
+//! ```rust
+//! use seqair::vcf::{Number, ValueType, VcfHeader, InfoInt, FormatGt};
+//! use seqair::vcf::record_encoder::{FormatFieldDef, Gt, InfoFieldDef, Scalar};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let mut builder = VcfHeader::builder();
+//! // advance past contigs/filters to the infos phase
+//! let mut builder = builder.infos();
+//!
+//! // Returns InfoKey<Scalar<i32>> (aliased InfoInt) — can only encode i32 values
+//! let dp_key: InfoInt = builder.register_info(
+//!     &InfoFieldDef::<Scalar<i32>>::new("DP", Number::Count(1), ValueType::Integer, "Depth")
+//! )?;
+//!
+//! // advance to the formats phase
+//! let mut builder = builder.formats();
+//!
+//! // Returns FormatKey<Gt> (aliased FormatGt) — can only encode Genotype slices
+//! let gt_key: FormatGt = builder.register_format(
+//!     &FormatFieldDef::<Gt>::new("GT", Number::Count(1), ValueType::String, "Genotype")
+//! )?;
+//!
+//! assert_eq!(dp_key.id().name(), "DP");
+//! assert_eq!(gt_key.id().name(), "GT");
+//! # Ok(())
+//! # }
+//! ```
+
+use super::error::VcfError;
+use super::header::{Number, ValueType};
+use super::record::Genotype;
+use seqair_types::SmolStr;
+use std::marker::PhantomData;
+
+// ── Value type markers (uninhabited) ───────────────────────────────────
+
+// r[impl record_encoder.typed_keys]
+
+/// Marker for a single scalar value.
+pub enum Scalar<T> {
+    #[doc(hidden)]
+    _Uninhabited(std::convert::Infallible, PhantomData<T>),
+}
+
+/// Marker for a variable-length array.
+pub enum Arr<T> {
+    #[doc(hidden)]
+    _Uninhabited(std::convert::Infallible, PhantomData<T>),
+}
+
+/// Marker for an array with optional (missing) elements.
+pub enum OptArr<T> {
+    #[doc(hidden)]
+    _Uninhabited(std::convert::Infallible, PhantomData<T>),
+}
+
+/// Marker for a flag field (no value).
+pub enum Flag {
+    #[doc(hidden)]
+    _Uninhabited(std::convert::Infallible),
+}
+
+/// Marker for a string field.
+pub enum Str {
+    #[doc(hidden)]
+    _Uninhabited(std::convert::Infallible),
+}
+
+/// Marker for genotype (GT) format field.
+pub enum Gt {
+    #[doc(hidden)]
+    _Uninhabited(std::convert::Infallible),
+}
+
+// ── Field identifiers ──────────────────────────────────────────────────
+
+// r[impl record_encoder.field_id]
+/// Base field identifier carrying both a BCF dictionary index and a string name.
+#[derive(Debug, Clone)]
+pub struct FieldId {
+    pub(crate) dict_idx: u32,
+    pub(crate) name: SmolStr,
+}
+
+impl FieldId {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn dict_idx(&self) -> u32 {
+        self.dict_idx
+    }
+}
+
+// r[impl record_encoder.contig_id]
+/// Resolved contig identifier carrying both integer tid and string name.
+#[derive(Debug, Clone)]
+pub struct ContigId {
+    pub(crate) tid: u32,
+    pub(crate) name: SmolStr,
+}
+
+impl ContigId {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn tid(&self) -> u32 {
+        self.tid
+    }
+}
+
+// r[impl record_encoder.filter_id]
+/// Resolved filter identifier carrying both dictionary index and name.
+#[derive(Debug, Clone)]
+pub struct FilterId {
+    pub(crate) dict_idx: u32,
+    pub(crate) name: SmolStr,
+}
+
+impl FilterId {
+    pub const PASS: FilterId = Self { dict_idx: 0, name: SmolStr::new_inline("PASS") };
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+    pub fn dict_idx(&self) -> u32 {
+        self.dict_idx
+    }
+}
+
+// ── Typed field keys ───────────────────────────────────────────────────
+
+// r[impl record_encoder.key_types]
+
+#[derive(Debug, Clone)]
+pub struct InfoKey<V>(pub(crate) FieldId, pub(crate) PhantomData<V>);
+
+#[derive(Debug, Clone)]
+pub struct FormatKey<V>(pub(crate) FieldId, pub(crate) PhantomData<V>);
+
+impl<V> InfoKey<V> {
+    pub fn id(&self) -> &FieldId {
+        &self.0
+    }
+}
+
+impl<V> FormatKey<V> {
+    pub fn id(&self) -> &FieldId {
+        &self.0
+    }
+}
+
+pub type InfoInt = InfoKey<Scalar<i32>>;
+pub type InfoFloat = InfoKey<Scalar<f32>>;
+pub type InfoInts = InfoKey<Arr<i32>>;
+pub type InfoFloats = InfoKey<Arr<f32>>;
+pub type InfoFlag = InfoKey<Flag>;
+pub type InfoString = InfoKey<Str>;
+pub type InfoIntOpts = InfoKey<OptArr<i32>>;
+
+pub type FormatGt = FormatKey<Gt>;
+pub type FormatInt = FormatKey<Scalar<i32>>;
+pub type FormatFloat = FormatKey<Scalar<f32>>;
+pub type FormatInts = FormatKey<Arr<i32>>;
+pub type FormatFloats = FormatKey<Arr<f32>>;
+pub type FormatFloatOpts = FormatKey<OptArr<f32>>;
+pub type FormatString = FormatKey<Str>;
+
+// ── InfoEncoder trait ──────────────────────────────────────────────────
+
+// r[impl record_encoder.info_methods+1]
+/// Object-safe trait for encoding INFO fields.
+pub trait InfoEncoder {
+    // r[impl record_encoder.reserved_rejection]
+    /// # Errors
+    /// [`crate::vcf::VcfEncodeError::ReservedIntValue`] if `value` is a reserved BCF pattern.
+    fn info_int(&mut self, id: &FieldId, value: i32) -> Result<(), VcfError>;
+    /// # Errors
+    /// [`crate::vcf::VcfEncodeError::ReservedFloatValue`] if `value` is a reserved BCF pattern.
+    fn info_float(&mut self, id: &FieldId, value: f32) -> Result<(), VcfError>;
+    /// # Errors
+    /// [`crate::vcf::VcfEncodeError::ReservedIntValue`] if any value is a reserved BCF pattern.
+    fn info_ints(&mut self, id: &FieldId, values: &[i32]) -> Result<(), VcfError>;
+    /// # Errors
+    /// [`crate::vcf::VcfEncodeError::ReservedFloatValue`] if any value is a reserved BCF pattern.
+    fn info_floats(&mut self, id: &FieldId, values: &[f32]) -> Result<(), VcfError>;
+    fn info_flag(&mut self, id: &FieldId);
+    fn info_string(&mut self, id: &FieldId, value: &str);
+    /// # Errors
+    /// [`crate::vcf::VcfEncodeError::ReservedIntValue`] if any concrete value is reserved.
+    fn info_int_opts(&mut self, id: &FieldId, values: &[Option<i32>]) -> Result<(), VcfError>;
+    fn n_allele(&self) -> usize;
+    fn n_alt(&self) -> usize;
+}
+
+// ── FormatEncoder trait ────────────────────────────────────────────────
+
+// r[impl record_encoder.format_methods]
+/// Object-safe trait for encoding FORMAT fields.
+pub trait FormatEncoder {
+    /// Encode a GT FORMAT field for all samples. Slice length MUST equal sample count.
+    fn format_gt(&mut self, id: &FieldId, gts: &[Genotype]) -> Result<(), VcfError>;
+    /// Encode a scalar integer FORMAT field for all samples.
+    fn format_int(&mut self, id: &FieldId, values: &[i32]) -> Result<(), VcfError>;
+    /// Encode a scalar float FORMAT field for all samples.
+    fn format_float(&mut self, id: &FieldId, values: &[f32]) -> Result<(), VcfError>;
+    /// Encode a multi-valued integer FORMAT field. `per_sample` holds one slice
+    /// per sample (its length MUST equal the sample count); each inner slice is
+    /// that sample's values. For BCF a single integer type is chosen across all
+    /// samples' values (smallest that fits), the stored width is the longest
+    /// inner slice, and shorter samples are padded with the integer
+    /// end-of-vector sentinel for that type.
+    fn format_ints(&mut self, id: &FieldId, per_sample: &[&[i32]]) -> Result<(), VcfError>;
+    /// Encode a multi-valued float FORMAT field. `per_sample` holds one slice
+    /// per sample (its length MUST equal the sample count); each inner slice is
+    /// that sample's values. For BCF the stored width is the longest inner
+    /// slice, shorter samples padded with the float end-of-vector sentinel.
+    fn format_floats(&mut self, id: &FieldId, per_sample: &[&[f32]]) -> Result<(), VcfError>;
+    /// Like [`format_floats`](Self::format_floats), but an element may be `None`:
+    /// the BCF float missing value, `.` in VCF text.
+    fn format_float_opts(
+        &mut self,
+        id: &FieldId,
+        per_sample: &[&[Option<f32>]],
+    ) -> Result<(), VcfError>;
+    /// Encode a string FORMAT field — one string per sample (its length MUST
+    /// equal the sample count). For BCF the stored width is the longest string,
+    /// shorter samples NUL-padded.
+    fn format_string(&mut self, id: &FieldId, values: &[&str]) -> Result<(), VcfError>;
+    fn n_allele(&self) -> usize;
+    fn n_alt(&self) -> usize;
+    /// Number of samples declared by the header.
+    fn n_samples(&self) -> usize;
+}
+
+// ── Key encode methods ─────────────────────────────────────────────────
+
+// r[impl record_encoder.key_encode]
+
+impl InfoKey<Scalar<i32>> {
+    /// Encode a scalar integer INFO value.
+    ///
+    /// # Errors
+    /// Returns [`crate::vcf::VcfEncodeError::ReservedIntValue`] if `value` is one
+    /// of the BCF reserved integer patterns (see `r[bcf_encoder.reserved_bands]`).
+    pub fn encode(
+        &self,
+        enc: &mut (impl InfoEncoder + ?Sized),
+        value: i32,
+    ) -> Result<(), VcfError> {
+        enc.info_int(&self.0, value)
+    }
+}
+
+impl InfoKey<Scalar<f32>> {
+    /// Encode a scalar float INFO value.
+    ///
+    /// # Errors
+    /// Returns [`crate::vcf::VcfEncodeError::ReservedFloatValue`] if `value`'s bit
+    /// pattern is one of the BCF reserved float patterns. `+inf` and quiet NaN are
+    /// ordinary values and are accepted.
+    pub fn encode(
+        &self,
+        enc: &mut (impl InfoEncoder + ?Sized),
+        value: f32,
+    ) -> Result<(), VcfError> {
+        enc.info_float(&self.0, value)
+    }
+}
+
+impl InfoKey<Arr<i32>> {
+    /// Encode an integer array INFO value.
+    ///
+    /// # Errors
+    /// Returns [`crate::vcf::VcfEncodeError::ReservedIntValue`] if any element is
+    /// one of the BCF reserved integer patterns.
+    pub fn encode(
+        &self,
+        enc: &mut (impl InfoEncoder + ?Sized),
+        values: &[i32],
+    ) -> Result<(), VcfError> {
+        enc.info_ints(&self.0, values)
+    }
+}
+
+impl InfoKey<Arr<f32>> {
+    /// Encode a float array INFO value.
+    ///
+    /// # Errors
+    /// Returns [`crate::vcf::VcfEncodeError::ReservedFloatValue`] if any element's
+    /// bit pattern is one of the BCF reserved float patterns.
+    pub fn encode(
+        &self,
+        enc: &mut (impl InfoEncoder + ?Sized),
+        values: &[f32],
+    ) -> Result<(), VcfError> {
+        enc.info_floats(&self.0, values)
+    }
+}
+
+impl InfoKey<Flag> {
+    pub fn encode(&self, enc: &mut (impl InfoEncoder + ?Sized)) {
+        enc.info_flag(&self.0);
+    }
+}
+
+impl InfoKey<Str> {
+    pub fn encode(&self, enc: &mut (impl InfoEncoder + ?Sized), value: &str) {
+        enc.info_string(&self.0, value);
+    }
+}
+
+impl InfoKey<OptArr<i32>> {
+    /// Encode an integer array INFO value with per-element missing markers.
+    ///
+    /// # Errors
+    /// Returns [`crate::vcf::VcfEncodeError::ReservedIntValue`] if any concrete
+    /// element is one of the BCF reserved integer patterns. `None` elements are the
+    /// missing marker by construction and are always accepted.
+    pub fn encode(
+        &self,
+        enc: &mut (impl InfoEncoder + ?Sized),
+        values: &[Option<i32>],
+    ) -> Result<(), VcfError> {
+        enc.info_int_opts(&self.0, values)
+    }
+}
+
+impl FormatKey<Gt> {
+    /// Encode a GT FORMAT field. `gts` must have exactly one entry per sample.
+    ///
+    /// # Errors
+    /// Returns [`VcfError::SampleCountMismatch`] if `gts.len() != n_samples`.
+    /// Returns [`VcfError::MixedPloidy`] if samples have different ploidy.
+    pub fn encode(
+        &self,
+        enc: &mut (impl FormatEncoder + ?Sized),
+        gts: &[Genotype],
+    ) -> Result<(), VcfError> {
+        if gts.len() != enc.n_samples() {
+            return Err(VcfError::SampleCountMismatch {
+                expected: enc.n_samples(),
+                got: gts.len(),
+            });
+        }
+        enc.format_gt(&self.0, gts)
+    }
+}
+
+impl FormatKey<Scalar<i32>> {
+    /// Encode a scalar integer FORMAT field. `values` must have exactly one entry per sample.
+    ///
+    /// # Errors
+    /// Returns [`VcfError::SampleCountMismatch`] if `values.len() != n_samples`.
+    pub fn encode(
+        &self,
+        enc: &mut (impl FormatEncoder + ?Sized),
+        values: &[i32],
+    ) -> Result<(), VcfError> {
+        if values.len() != enc.n_samples() {
+            return Err(VcfError::SampleCountMismatch {
+                expected: enc.n_samples(),
+                got: values.len(),
+            });
+        }
+        enc.format_int(&self.0, values)
+    }
+}
+
+impl FormatKey<Scalar<f32>> {
+    /// Encode a scalar float FORMAT field. `values` must have exactly one entry per sample.
+    ///
+    /// # Errors
+    /// Returns [`VcfError::SampleCountMismatch`] if `values.len() != n_samples`.
+    pub fn encode(
+        &self,
+        enc: &mut (impl FormatEncoder + ?Sized),
+        values: &[f32],
+    ) -> Result<(), VcfError> {
+        if values.len() != enc.n_samples() {
+            return Err(VcfError::SampleCountMismatch {
+                expected: enc.n_samples(),
+                got: values.len(),
+            });
+        }
+        enc.format_float(&self.0, values)
+    }
+}
+
+impl FormatKey<Arr<i32>> {
+    /// Encode a multi-valued integer FORMAT field. `per_sample` must have exactly
+    /// one slice per sample.
+    ///
+    /// # Errors
+    /// Returns [`VcfError::SampleCountMismatch`] if `per_sample.len() != n_samples`.
+    pub fn encode(
+        &self,
+        enc: &mut (impl FormatEncoder + ?Sized),
+        per_sample: &[&[i32]],
+    ) -> Result<(), VcfError> {
+        if per_sample.len() != enc.n_samples() {
+            return Err(VcfError::SampleCountMismatch {
+                expected: enc.n_samples(),
+                got: per_sample.len(),
+            });
+        }
+        enc.format_ints(&self.0, per_sample)
+    }
+}
+
+impl FormatKey<Arr<f32>> {
+    /// Encode a multi-valued float FORMAT field. `per_sample` must have exactly
+    /// one slice per sample.
+    ///
+    /// # Errors
+    /// Returns [`VcfError::SampleCountMismatch`] if `per_sample.len() != n_samples`.
+    pub fn encode(
+        &self,
+        enc: &mut (impl FormatEncoder + ?Sized),
+        per_sample: &[&[f32]],
+    ) -> Result<(), VcfError> {
+        if per_sample.len() != enc.n_samples() {
+            return Err(VcfError::SampleCountMismatch {
+                expected: enc.n_samples(),
+                got: per_sample.len(),
+            });
+        }
+        enc.format_floats(&self.0, per_sample)
+    }
+}
+
+// r[impl record_encoder.format_single_sample]
+
+impl FormatKey<Arr<i32>> {
+    /// Encode this multi-valued integer FORMAT field for a single-sample record,
+    /// passing that one sample's values directly instead of wrapping them in a
+    /// `&[&[i32]]`.
+    ///
+    /// # Errors
+    /// Returns [`VcfError::SampleCountMismatch`] if the header declares anything
+    /// other than exactly one sample.
+    pub fn encode_single_sample(
+        &self,
+        enc: &mut (impl FormatEncoder + ?Sized),
+        values: &[i32],
+    ) -> Result<(), VcfError> {
+        if enc.n_samples() != 1 {
+            return Err(VcfError::SampleCountMismatch { expected: enc.n_samples(), got: 1 });
+        }
+        enc.format_ints(&self.0, &[values])
+    }
+}
+
+impl FormatKey<Arr<f32>> {
+    /// Encode this multi-valued float FORMAT field for a single-sample record,
+    /// passing that one sample's values directly instead of wrapping them in a
+    /// `&[&[f32]]`.
+    ///
+    /// # Errors
+    /// Returns [`VcfError::SampleCountMismatch`] if the header declares anything
+    /// other than exactly one sample.
+    pub fn encode_single_sample(
+        &self,
+        enc: &mut (impl FormatEncoder + ?Sized),
+        values: &[f32],
+    ) -> Result<(), VcfError> {
+        if enc.n_samples() != 1 {
+            return Err(VcfError::SampleCountMismatch { expected: enc.n_samples(), got: 1 });
+        }
+        enc.format_floats(&self.0, &[values])
+    }
+}
+
+impl FormatKey<OptArr<f32>> {
+    /// Encode this multi-valued float FORMAT field for a single-sample record, with
+    /// per-element missing markers.
+    ///
+    /// # Errors
+    /// Returns [`VcfError::SampleCountMismatch`] if the header declares anything
+    /// other than exactly one sample, and [`crate::vcf::VcfEncodeError::ReservedFloatValue`]
+    /// if a concrete element is a reserved BCF float pattern. `None` elements are the
+    /// missing marker by construction and are always accepted.
+    pub fn encode_single_sample(
+        &self,
+        enc: &mut (impl FormatEncoder + ?Sized),
+        values: &[Option<f32>],
+    ) -> Result<(), VcfError> {
+        if enc.n_samples() != 1 {
+            return Err(VcfError::SampleCountMismatch { expected: enc.n_samples(), got: 1 });
+        }
+        enc.format_float_opts(&self.0, &[values])
+    }
+}
+
+impl FormatKey<Str> {
+    /// Encode a string FORMAT field. `values` must have exactly one string per sample.
+    ///
+    /// # Errors
+    /// Returns [`VcfError::SampleCountMismatch`] if `values.len() != n_samples`.
+    pub fn encode(
+        &self,
+        enc: &mut (impl FormatEncoder + ?Sized),
+        values: &[&str],
+    ) -> Result<(), VcfError> {
+        if values.len() != enc.n_samples() {
+            return Err(VcfError::SampleCountMismatch {
+                expected: enc.n_samples(),
+                got: values.len(),
+            });
+        }
+        enc.format_string(&self.0, values)
+    }
+}
+
+// ── Field definitions ──────────────────────────────────────────────────
+
+// r[impl record_encoder.field_def]
+// r[impl record_encoder.field_def_types]
+
+pub struct InfoFieldDef<V> {
+    pub name: &'static str,
+    pub number: Number,
+    pub value_type: ValueType,
+    pub description: &'static str,
+    _marker: PhantomData<V>,
+}
+
+// r[impl record_encoder.field_def_const]
+impl<V> InfoFieldDef<V> {
+    pub const fn new(
+        name: &'static str,
+        number: Number,
+        value_type: ValueType,
+        description: &'static str,
+    ) -> Self {
+        Self { name, number, value_type, description, _marker: PhantomData }
+    }
+}
+
+pub struct FormatFieldDef<V> {
+    pub name: &'static str,
+    pub number: Number,
+    pub value_type: ValueType,
+    pub description: &'static str,
+    _marker: PhantomData<V>,
+}
+
+impl<V> FormatFieldDef<V> {
+    pub const fn new(
+        name: &'static str,
+        number: Number,
+        value_type: ValueType,
+        description: &'static str,
+    ) -> Self {
+        Self { name, number, value_type, description, _marker: PhantomData }
+    }
+}
+
+pub struct FilterFieldDef {
+    pub name: &'static str,
+    pub description: &'static str,
+}
+
+impl FilterFieldDef {
+    pub const fn new(name: &'static str, description: &'static str) -> Self {
+        Self { name, description }
+    }
+}
+
+// ── FieldDescription trait ─────────────────────────────────────────────
+
+// r[impl record_encoder.field_description]
+pub trait FieldDescription {
+    fn name(&self) -> &str;
+    fn number(&self) -> Number;
+    fn value_type(&self) -> ValueType;
+    fn description(&self) -> &str;
+}
+
+impl<V> FieldDescription for InfoFieldDef<V> {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn number(&self) -> Number {
+        self.number
+    }
+    fn value_type(&self) -> ValueType {
+        self.value_type
+    }
+    fn description(&self) -> &str {
+        self.description
+    }
+}
+
+impl<V> FieldDescription for FormatFieldDef<V> {
+    fn name(&self) -> &str {
+        self.name
+    }
+    fn number(&self) -> Number {
+        self.number
+    }
+    fn value_type(&self) -> ValueType {
+        self.value_type
+    }
+    fn description(&self) -> &str {
+        self.description
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::vcf::OutputFormat;
+    use crate::vcf::alleles::Alleles;
+    use crate::vcf::header::ContigDef;
+    use crate::vcf::record::Genotype;
+    use crate::vcf::unified::Writer;
+    use seqair_types::{Base, Pos1};
+    use std::sync::Arc;
+
+    // r[verify record_encoder.field_def_const]
+    #[test]
+    fn field_defs_are_const() {
+        const DP: InfoFieldDef<Scalar<i32>> =
+            InfoFieldDef::new("DP", Number::Count(1), ValueType::Integer, "Combined depth");
+        const GT: FormatFieldDef<Gt> =
+            FormatFieldDef::new("GT", Number::Count(1), ValueType::String, "Genotype");
+        const LOW_DP: FilterFieldDef = FilterFieldDef::new("lowDp", "Low read depth");
+
+        assert_eq!(DP.name, "DP");
+        assert_eq!(GT.name, "GT");
+        assert_eq!(LOW_DP.name, "lowDp");
+    }
+
+    // r[verify record_encoder.field_description]
+    #[test]
+    fn field_description_trait() {
+        let dp = InfoFieldDef::<Scalar<i32>>::new(
+            "DP",
+            Number::Count(1),
+            ValueType::Integer,
+            "Combined depth",
+        );
+        let desc: &dyn FieldDescription = &dp;
+        assert_eq!(desc.name(), "DP");
+        assert_eq!(desc.number(), Number::Count(1));
+        assert_eq!(desc.value_type(), ValueType::Integer);
+        assert_eq!(desc.description(), "Combined depth");
+    }
+
+    // r[verify record_encoder.filter_id]
+    #[test]
+    fn filter_id_pass() {
+        let pass = FilterId::PASS;
+        assert_eq!(pass.dict_idx, 0);
+        assert_eq!(pass.name(), "PASS");
+    }
+
+    // r[verify record_encoder.typed_keys]
+    #[test]
+    fn typed_keys_prevent_misuse() {
+        let _int_key: InfoInt =
+            InfoKey(FieldId { dict_idx: 0, name: SmolStr::from("DP") }, PhantomData);
+        let _float_key: InfoFloat =
+            InfoKey(FieldId { dict_idx: 1, name: SmolStr::from("BQ") }, PhantomData);
+        let _flag_key: InfoFlag =
+            InfoKey(FieldId { dict_idx: 2, name: SmolStr::from("CPG") }, PhantomData);
+    }
+
+    struct TestSetup {
+        header: Arc<crate::vcf::header::VcfHeader>,
+        contig: ContigId,
+        dp_info: InfoInt,
+        bq_info: InfoFloat,
+        db_flag: InfoFlag,
+        ad_info: InfoInts,
+        gt_fmt: FormatGt,
+        dp_fmt: FormatInt,
+    }
+
+    impl TestSetup {
+        fn new() -> Self {
+            let mut builder = crate::vcf::header::VcfHeader::builder();
+            let contig = builder.register_contig("chr1", ContigDef { length: Some(1000) }).unwrap();
+            let mut builder = builder.infos();
+            let dp_info = builder
+                .register_info(&InfoFieldDef::new(
+                    "DP",
+                    Number::Count(1),
+                    ValueType::Integer,
+                    "Depth",
+                ))
+                .unwrap();
+            let bq_info = builder
+                .register_info(&InfoFieldDef::new(
+                    "BQ",
+                    Number::Count(1),
+                    ValueType::Float,
+                    "Base quality",
+                ))
+                .unwrap();
+            let db_flag = builder
+                .register_info(&InfoFieldDef::new("DB", Number::Count(0), ValueType::Flag, "dbSNP"))
+                .unwrap();
+            let ad_info = builder
+                .register_info(&InfoFieldDef::new(
+                    "AD",
+                    Number::ReferenceAlternateBases,
+                    ValueType::Integer,
+                    "Allele depth",
+                ))
+                .unwrap();
+            let mut builder = builder.formats();
+            let gt_fmt = builder
+                .register_format(&FormatFieldDef::new(
+                    "GT",
+                    Number::Count(1),
+                    ValueType::String,
+                    "Genotype",
+                ))
+                .unwrap();
+            let dp_fmt = builder
+                .register_format(&FormatFieldDef::new(
+                    "DP",
+                    Number::Count(1),
+                    ValueType::Integer,
+                    "Read depth",
+                ))
+                .unwrap();
+            let mut builder = builder.samples();
+            builder.add_sample("S1").unwrap();
+            let header = Arc::new(builder.build().unwrap());
+            Self { header, contig, dp_info, bq_info, db_flag, ad_info, gt_fmt, dp_fmt }
+        }
+    }
+
+    // r[verify record_encoder.register]
+    // r[verify record_encoder.register_contig]
+    // r[verify record_encoder.field_id]
+    // r[verify record_encoder.contig_id]
+    #[test]
+    fn register_resolves_correct_dict_indices() {
+        let setup = TestSetup::new();
+        assert_eq!(setup.contig.tid(), 0);
+        assert_eq!(setup.contig.name(), "chr1");
+
+        let map = setup.header.string_map();
+        assert_eq!(map.get("DP").unwrap(), setup.dp_info.id().dict_idx() as usize, "INFO DP");
+        assert_eq!(map.get("BQ").unwrap(), setup.bq_info.id().dict_idx() as usize, "INFO BQ");
+        assert_eq!(map.get("DB").unwrap(), setup.db_flag.id().dict_idx() as usize, "INFO DB");
+        assert_eq!(map.get("GT").unwrap(), setup.gt_fmt.id().dict_idx() as usize, "FORMAT GT");
+    }
+
+    // r[verify record_encoder.field_def]
+    // r[verify record_encoder.field_def_types]
+    #[test]
+    fn field_def_generic_keys_encode() {
+        let setup = TestSetup::new();
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Bcf);
+        let mut writer = writer.write_header(&setup.header).unwrap();
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        let mut enc = writer
+            .begin_record(&setup.contig, Pos1::new(1).unwrap(), &alleles, None)
+            .unwrap()
+            .filter_pass();
+        setup.dp_info.encode(&mut enc, 42).unwrap();
+        enc.emit().unwrap();
+        writer.finish().unwrap();
+        assert!(!buf.is_empty());
+    }
+
+    // r[verify record_encoder.filters]
+    #[test]
+    fn filter_fail_bcf_and_vcf_text() {
+        let mut builder = crate::vcf::header::VcfHeader::builder();
+        let contig = builder.register_contig("chr1", ContigDef { length: Some(1000) }).unwrap();
+        let mut builder = builder.filters();
+        let low_dp = builder.register_filter(&FilterFieldDef::new("lowDp", "Low depth")).unwrap();
+        let header = Arc::new(builder.build().unwrap());
+
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        let pos = Pos1::new(10).unwrap();
+
+        let bcf_bytes = {
+            let mut buf = Vec::new();
+            let writer = Writer::new(&mut buf, OutputFormat::Bcf);
+            let mut writer = writer.write_header(&header).unwrap();
+            writer
+                .begin_record(&contig, pos, &alleles, None)
+                .unwrap()
+                .filter_fail([&low_dp])
+                .emit()
+                .unwrap();
+            writer.finish().unwrap();
+            buf
+        };
+        assert!(!bcf_bytes.is_empty(), "BCF output must not be empty");
+
+        let vcf_text = {
+            let mut buf = Vec::new();
+            let writer = Writer::new(&mut buf, OutputFormat::Vcf);
+            let mut writer = writer.write_header(&header).unwrap();
+            writer
+                .begin_record(&contig, pos, &alleles, None)
+                .unwrap()
+                .filter_fail([&low_dp])
+                .emit()
+                .unwrap();
+            writer.finish().unwrap();
+            String::from_utf8(buf).unwrap()
+        };
+        let data_line = vcf_text.lines().find(|l| !l.starts_with('#')).unwrap();
+        let filter_col = data_line.split('\t').nth(6).unwrap();
+        assert_eq!(filter_col, "lowDp", "filter_fail must write the filter name");
+    }
+
+    // r[verify record_encoder.info_methods+1]
+    // r[verify record_encoder.format_methods]
+    // r[verify record_encoder.key_encode]
+    // r[verify record_encoder.bcf_encoding]
+    #[test]
+    fn typestate_api_bcf() {
+        let setup = TestSetup::new();
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Bcf);
+        let mut writer = writer.write_header(&setup.header).unwrap();
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        let mut enc = writer
+            .begin_record(&setup.contig, Pos1::new(100).unwrap(), &alleles, Some(30.0))
+            .unwrap()
+            .filter_pass();
+        setup.dp_info.encode(&mut enc, 50).unwrap();
+        setup.bq_info.encode(&mut enc, 35.5).unwrap();
+        setup.db_flag.encode(&mut enc);
+        setup.ad_info.encode(&mut enc, &[30, 20]).unwrap();
+        let mut enc = enc.begin_samples();
+        setup.gt_fmt.encode(&mut enc, &[Genotype::unphased(0, 1)]).unwrap();
+        setup.dp_fmt.encode(&mut enc, &[45]).unwrap();
+        enc.emit().unwrap();
+        writer.finish().unwrap();
+        assert!(!buf.is_empty());
+    }
+
+    // r[verify record_encoder.vcf_encoding]
+    #[test]
+    fn typestate_emit_without_samples() {
+        let setup = TestSetup::new();
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Vcf);
+        let mut writer = writer.write_header(&setup.header).unwrap();
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        let mut enc = writer
+            .begin_record(&setup.contig, Pos1::new(100).unwrap(), &alleles, Some(30.0))
+            .unwrap()
+            .filter_pass();
+        setup.dp_info.encode(&mut enc, 50).unwrap();
+        enc.emit().unwrap();
+        writer.finish().unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let data_line = text.lines().find(|l| !l.starts_with('#')).unwrap();
+        let cols: Vec<&str> = data_line.split('\t').collect();
+        assert_eq!(cols.first(), Some(&"chr1"), "CHROM");
+        assert_eq!(cols.get(1), Some(&"100"), "POS");
+        assert_eq!(cols.get(6), Some(&"PASS"), "FILTER");
+    }
+
+    // r[verify record_encoder.filters]
+    #[test]
+    fn typestate_filter_fail() {
+        let mut hb = crate::vcf::header::VcfHeader::builder();
+        let contig = hb.register_contig("chr1", ContigDef { length: Some(1000) }).unwrap();
+        let mut hb = hb.filters();
+        let ld = hb.register_filter(&FilterFieldDef::new("lowDp", "Low depth")).unwrap();
+        let header = Arc::new(hb.build().unwrap());
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Vcf);
+        let mut writer = writer.write_header(&header).unwrap();
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        writer
+            .begin_record(&contig, Pos1::new(10).unwrap(), &alleles, None)
+            .unwrap()
+            .filter_fail([&ld])
+            .emit()
+            .unwrap();
+        writer.finish().unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let data_line = text.lines().find(|l| !l.starts_with('#')).unwrap();
+        let filter_col = data_line.split('\t').nth(6).unwrap();
+        assert_eq!(filter_col, "lowDp");
+    }
+
+    // r[verify record_encoder.vcf_encoding]
+    #[test]
+    fn typestate_no_filter() {
+        let setup = TestSetup::new();
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Vcf);
+        let mut writer = writer.write_header(&setup.header).unwrap();
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        writer
+            .begin_record(&setup.contig, Pos1::new(1).unwrap(), &alleles, None)
+            .unwrap()
+            .filter_pass()
+            .emit()
+            .unwrap();
+        writer.finish().unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let data_line = text.lines().find(|l| !l.starts_with('#')).unwrap();
+        assert_eq!(data_line.split('\t').nth(6), Some("PASS"));
+    }
+
+    // r[verify record_encoder.bcf_encoding]
+    // r[verify record_encoder.vcf_encoding]
+    #[test]
+    fn typestate_multiple_records() {
+        let setup = TestSetup::new();
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Vcf);
+        let mut writer = writer.write_header(&setup.header).unwrap();
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        for pos in [1u32, 100, 200] {
+            writer
+                .begin_record(&setup.contig, Pos1::new(pos).unwrap(), &alleles, None)
+                .unwrap()
+                .filter_pass()
+                .emit()
+                .unwrap();
+        }
+        writer.finish().unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let data_lines: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(data_lines.len(), 3, "expected 3 data records");
+    }
+
+    // ── Multi-sample tests ───────────────────────────────────────────
+
+    fn multi_sample_setup()
+    -> (Arc<crate::vcf::header::VcfHeader>, ContigId, InfoInt, FormatGt, FormatInt) {
+        let mut builder = crate::vcf::header::VcfHeader::builder();
+        let contig = builder.register_contig("chr1", ContigDef { length: Some(1000) }).unwrap();
+        let mut builder = builder.infos();
+        let dp_info = builder
+            .register_info(&InfoFieldDef::new("DP", Number::Count(1), ValueType::Integer, "Depth"))
+            .unwrap();
+        let mut builder = builder.formats();
+        let gt_fmt = builder
+            .register_format(&FormatFieldDef::new(
+                "GT",
+                Number::Count(1),
+                ValueType::String,
+                "Genotype",
+            ))
+            .unwrap();
+        let dp_fmt = builder
+            .register_format(&FormatFieldDef::new(
+                "DP",
+                Number::Count(1),
+                ValueType::Integer,
+                "Read depth",
+            ))
+            .unwrap();
+        let mut builder = builder.samples();
+        builder.add_sample("S1").unwrap();
+        builder.add_sample("S2").unwrap();
+        builder.add_sample("S3").unwrap();
+        let header = Arc::new(builder.build().unwrap());
+        (header, contig, dp_info, gt_fmt, dp_fmt)
+    }
+
+    // r[verify record_encoder.format_methods]
+    #[test]
+    fn multi_sample_bcf() {
+        let (header, contig, dp_info, gt_fmt, dp_fmt) = multi_sample_setup();
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Bcf);
+        let mut writer = writer.write_header(&header).unwrap();
+
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        let enc =
+            writer.begin_record(&contig, Pos1::new(100).unwrap(), &alleles, Some(30.0)).unwrap();
+        let mut enc = enc.filter_pass();
+        dp_info.encode(&mut enc, 150).unwrap();
+        let mut enc = enc.begin_samples();
+        gt_fmt
+            .encode(
+                &mut enc,
+                &[Genotype::unphased(0, 1), Genotype::unphased(0, 0), Genotype::unphased(1, 1)],
+            )
+            .unwrap();
+        dp_fmt.encode(&mut enc, &[45, 52, 38]).unwrap();
+        enc.emit().unwrap();
+
+        writer.finish().unwrap();
+        assert!(!buf.is_empty());
+    }
+
+    // r[verify record_encoder.format_methods]
+    #[test]
+    fn multi_sample_vcf_text() {
+        let (header, contig, dp_info, gt_fmt, dp_fmt) = multi_sample_setup();
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Vcf);
+        let mut writer = writer.write_header(&header).unwrap();
+
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        let enc =
+            writer.begin_record(&contig, Pos1::new(100).unwrap(), &alleles, Some(30.0)).unwrap();
+        let mut enc = enc.filter_pass();
+        dp_info.encode(&mut enc, 150).unwrap();
+        let mut enc = enc.begin_samples();
+        gt_fmt
+            .encode(
+                &mut enc,
+                &[Genotype::unphased(0, 1), Genotype::unphased(0, 0), Genotype::unphased(1, 1)],
+            )
+            .unwrap();
+        dp_fmt.encode(&mut enc, &[45, 52, 38]).unwrap();
+        enc.emit().unwrap();
+
+        writer.finish().unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let data_line = text.lines().find(|l| !l.starts_with('#')).unwrap();
+        let cols: Vec<&str> = data_line.split('\t').collect();
+        // 8 fixed + FORMAT + 3 samples = 12 columns
+        assert_eq!(cols.len(), 12, "expected 12 columns for 3-sample VCF");
+        assert_eq!(cols[8], "GT:DP", "FORMAT column");
+        assert_eq!(cols[9], "0/1:45", "sample 1");
+        assert_eq!(cols[10], "0/0:52", "sample 2");
+        assert_eq!(cols[11], "1/1:38", "sample 3");
+    }
+
+    // r[verify record_encoder.format_methods]
+    #[test]
+    fn single_sample_slice_api() {
+        let setup = TestSetup::new();
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Bcf);
+        let mut writer = writer.write_header(&setup.header).unwrap();
+
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        let enc = writer
+            .begin_record(&setup.contig, Pos1::new(100).unwrap(), &alleles, Some(30.0))
+            .unwrap();
+        let mut enc = enc.filter_pass();
+        setup.dp_info.encode(&mut enc, 50).unwrap();
+        let mut enc = enc.begin_samples();
+        // Single-sample callers pass 1-element slices
+        setup.gt_fmt.encode(&mut enc, &[Genotype::unphased(0, 1)]).unwrap();
+        setup.dp_fmt.encode(&mut enc, &[45]).unwrap();
+        enc.emit().unwrap();
+
+        writer.finish().unwrap();
+        assert!(!buf.is_empty());
+    }
+
+    // r[verify record_encoder.format_single_sample]
+    #[test]
+    fn format_single_sample_helper_matches_nested_slice() {
+        let mut builder = crate::vcf::header::VcfHeader::builder();
+        let contig = builder.register_contig("chr1", ContigDef { length: Some(1000) }).unwrap();
+        let mut builder = builder.formats();
+        let pl_fmt: FormatInts = builder
+            .register_format(&FormatFieldDef::new(
+                "PL",
+                Number::Genotypes,
+                ValueType::Integer,
+                "Phred likelihoods",
+            ))
+            .unwrap();
+        let mut builder = builder.samples();
+        builder.add_sample("S1").unwrap();
+        let header = Arc::new(builder.build().unwrap());
+
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Vcf);
+        let mut writer = writer.write_header(&header).unwrap();
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        let enc = writer
+            .begin_record(&contig, Pos1::new(1).unwrap(), &alleles, None)
+            .unwrap()
+            .filter_pass();
+        let mut enc = enc.begin_samples();
+        // The flat helper must produce the same bytes as the explicit &[&[..]] form.
+        pl_fmt.encode_single_sample(&mut enc, &[10, 20, 30]).unwrap();
+        enc.emit().unwrap();
+        writer.finish().unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let data_line = text.lines().find(|l| !l.starts_with('#')).unwrap();
+        let cols: Vec<&str> = data_line.split('\t').collect();
+        assert_eq!(cols[8], "PL");
+        assert_eq!(cols[9], "10,20,30");
+    }
+
+    #[test]
+    fn format_single_sample_helper_rejects_multi_sample() {
+        let mut hb = crate::vcf::header::VcfHeader::builder();
+        let contig = hb.register_contig("chr1", ContigDef { length: Some(1000) }).unwrap();
+        let mut hb = hb.formats();
+        let af: FormatFloats = hb
+            .register_format(&FormatFieldDef::new(
+                "AF",
+                Number::Unknown,
+                ValueType::Float,
+                "Allele freq",
+            ))
+            .unwrap();
+        let mut hb = hb.samples();
+        hb.add_sample("A").unwrap();
+        hb.add_sample("B").unwrap();
+        let header = Arc::new(hb.build().unwrap());
+
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Vcf);
+        let mut writer = writer.write_header(&header).unwrap();
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        let enc = writer
+            .begin_record(&contig, Pos1::new(1).unwrap(), &alleles, None)
+            .unwrap()
+            .filter_pass();
+        let mut enc = enc.begin_samples();
+        // Header has 2 samples → the single-sample helper must refuse.
+        let result = af.encode_single_sample(&mut enc, &[0.5]);
+        assert!(matches!(result, Err(VcfError::SampleCountMismatch { .. })));
+    }
+
+    #[test]
+    fn format_int_panics_on_sample_count_mismatch() {
+        let setup = TestSetup::new(); // 1 sample
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Bcf);
+        let mut writer = writer.write_header(&setup.header).unwrap();
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        let enc = writer
+            .begin_record(&setup.contig, Pos1::new(100).unwrap(), &alleles, Some(30.0))
+            .unwrap()
+            .filter_pass();
+        let mut enc = enc.begin_samples();
+        // Pass 2 values for 1-sample header — must return Err
+        let result = setup.dp_fmt.encode(&mut enc, &[45, 52]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn format_gt_panics_on_sample_count_mismatch() {
+        let setup = TestSetup::new(); // 1 sample
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Vcf);
+        let mut writer = writer.write_header(&setup.header).unwrap();
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        let enc = writer
+            .begin_record(&setup.contig, Pos1::new(100).unwrap(), &alleles, Some(30.0))
+            .unwrap()
+            .filter_pass();
+        let mut enc = enc.begin_samples();
+        // Pass 3 genotypes for 1-sample header — must return Err
+        let result = setup.gt_fmt.encode(
+            &mut enc,
+            &[Genotype::unphased(0, 1), Genotype::unphased(0, 0), Genotype::unphased(1, 1)],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn format_gt_panics_on_mixed_ploidy() {
+        let (header, contig, _dp_info, gt_fmt, _dp_fmt) = multi_sample_setup();
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Bcf);
+        let mut writer = writer.write_header(&header).unwrap();
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        let enc = writer
+            .begin_record(&contig, Pos1::new(100).unwrap(), &alleles, Some(30.0))
+            .unwrap()
+            .filter_pass();
+        let mut enc = enc.begin_samples();
+        // Haploid + diploid + diploid — must return Err
+        let result = gt_fmt.encode(
+            &mut enc,
+            &[Genotype::haploid(0), Genotype::unphased(0, 1), Genotype::unphased(1, 1)],
+        );
+        assert!(result.is_err());
+    }
+
+    // ── INFO dedup tests ────────────────────────────────────────────
+
+    // r[verify record_encoder.info_dedup]
+    #[test]
+    fn info_overwrite_last_value_wins_vcf() {
+        let setup = TestSetup::new();
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Vcf);
+        let mut writer = writer.write_header(&setup.header).unwrap();
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        let mut enc = writer
+            .begin_record(&setup.contig, Pos1::new(100).unwrap(), &alleles, Some(30.0))
+            .unwrap()
+            .filter_pass();
+        setup.dp_info.encode(&mut enc, 50).unwrap();
+        setup.dp_info.encode(&mut enc, 100).unwrap(); // overwrite
+        enc.emit().unwrap();
+        writer.finish().unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let data_line = text.lines().find(|l| !l.starts_with('#')).unwrap();
+        let info_col = data_line.split('\t').nth(7).unwrap();
+        assert_eq!(info_col, "DP=100", "duplicate INFO should keep only the last value");
+    }
+
+    // r[verify record_encoder.info_dedup]
+    #[test]
+    fn info_overwrite_first_of_multiple_vcf() {
+        let setup = TestSetup::new();
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Vcf);
+        let mut writer = writer.write_header(&setup.header).unwrap();
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        let mut enc = writer
+            .begin_record(&setup.contig, Pos1::new(100).unwrap(), &alleles, Some(30.0))
+            .unwrap()
+            .filter_pass();
+        setup.dp_info.encode(&mut enc, 50).unwrap();
+        setup.bq_info.encode(&mut enc, 35.5).unwrap();
+        setup.dp_info.encode(&mut enc, 100).unwrap(); // overwrite first
+        enc.emit().unwrap();
+        writer.finish().unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let data_line = text.lines().find(|l| !l.starts_with('#')).unwrap();
+        let info_col = data_line.split('\t').nth(7).unwrap();
+        // In-place overwrite (htslib parity): DP keeps its original first position.
+        assert_eq!(info_col, "DP=100;BQ=35.5", "overwritten field keeps its original position");
+    }
+
+    // r[verify record_encoder.info_dedup]
+    #[test]
+    fn info_overwrite_middle_vcf() {
+        let setup = TestSetup::new();
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Vcf);
+        let mut writer = writer.write_header(&setup.header).unwrap();
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        let mut enc = writer
+            .begin_record(&setup.contig, Pos1::new(100).unwrap(), &alleles, Some(30.0))
+            .unwrap()
+            .filter_pass();
+        setup.dp_info.encode(&mut enc, 50).unwrap();
+        setup.bq_info.encode(&mut enc, 35.5).unwrap();
+        setup.db_flag.encode(&mut enc);
+        setup.bq_info.encode(&mut enc, 99.0).unwrap(); // overwrite middle
+        enc.emit().unwrap();
+        writer.finish().unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let data_line = text.lines().find(|l| !l.starts_with('#')).unwrap();
+        let info_col = data_line.split('\t').nth(7).unwrap();
+        // In-place overwrite (htslib parity): BQ keeps its middle position.
+        assert_eq!(info_col, "DP=50;BQ=99;DB", "overwritten middle field keeps its position");
+    }
+
+    // r[verify record_encoder.info_dedup]
+    #[test]
+    fn info_overwrite_last_value_wins_bcf() {
+        let setup = TestSetup::new();
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Bcf);
+        let mut writer = writer.write_header(&setup.header).unwrap();
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        let mut enc = writer
+            .begin_record(&setup.contig, Pos1::new(100).unwrap(), &alleles, Some(30.0))
+            .unwrap()
+            .filter_pass();
+        setup.dp_info.encode(&mut enc, 50).unwrap();
+        setup.bq_info.encode(&mut enc, 35.5).unwrap();
+        setup.dp_info.encode(&mut enc, 100).unwrap(); // overwrite
+        enc.emit().unwrap();
+        writer.finish().unwrap();
+
+        // Parse with noodles to verify the BCF is valid and has the correct value
+        use noodles::bcf;
+        use noodles::vcf::variant::record_buf::info::field::Value as InfoBufValue;
+        let mut reader = bcf::io::Reader::new(std::io::Cursor::new(&buf));
+        let header = reader.read_header().unwrap();
+        let mut records = reader.record_bufs(&header);
+        let rec = records.next().unwrap().unwrap();
+        let dp =
+            rec.info().get("DP").expect("DP should exist").expect("DP value should not be None");
+        assert!(
+            matches!(dp, &InfoBufValue::Integer(100)),
+            "BCF DP should be overwritten to 100, got {dp:?}"
+        );
+    }
+
+    // r[verify record_encoder.info_dedup]
+    #[test]
+    fn info_dedup_tracker_resets_between_records() {
+        let setup = TestSetup::new();
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Vcf);
+        let mut writer = writer.write_header(&setup.header).unwrap();
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+
+        // Record 1: write DP=50
+        let mut enc = writer
+            .begin_record(&setup.contig, Pos1::new(100).unwrap(), &alleles, Some(30.0))
+            .unwrap()
+            .filter_pass();
+        setup.dp_info.encode(&mut enc, 50).unwrap();
+        enc.emit().unwrap();
+
+        // Record 2: write DP=100 — should NOT be treated as a duplicate
+        let mut enc = writer
+            .begin_record(&setup.contig, Pos1::new(200).unwrap(), &alleles, Some(30.0))
+            .unwrap()
+            .filter_pass();
+        setup.dp_info.encode(&mut enc, 100).unwrap();
+        enc.emit().unwrap();
+
+        writer.finish().unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let data_lines: Vec<&str> = text.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(data_lines.len(), 2);
+        assert_eq!(data_lines[0].split('\t').nth(7).unwrap(), "DP=50");
+        assert_eq!(data_lines[1].split('\t').nth(7).unwrap(), "DP=100");
+    }
+
+    // ── FORMAT dedup tests ──────────────────────────────────────────
+
+    // r[verify record_encoder.format_dedup]
+    #[test]
+    fn format_overwrite_last_value_wins_vcf() {
+        let setup = TestSetup::new(); // 1 sample
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Vcf);
+        let mut writer = writer.write_header(&setup.header).unwrap();
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        let enc = writer
+            .begin_record(&setup.contig, Pos1::new(100).unwrap(), &alleles, Some(30.0))
+            .unwrap()
+            .filter_pass();
+        let mut enc = enc.begin_samples();
+        setup.gt_fmt.encode(&mut enc, &[Genotype::unphased(0, 1)]).unwrap();
+        setup.dp_fmt.encode(&mut enc, &[45]).unwrap();
+        setup.dp_fmt.encode(&mut enc, &[99]).unwrap(); // overwrite
+        enc.emit().unwrap();
+        writer.finish().unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let data_line = text.lines().find(|l| !l.starts_with('#')).unwrap();
+        let cols: Vec<&str> = data_line.split('\t').collect();
+        assert_eq!(cols[8], "GT:DP", "FORMAT column should list each key once");
+        assert_eq!(cols[9], "0/1:99", "overwritten FORMAT DP should be 99");
+    }
+
+    // r[verify record_encoder.format_dedup]
+    #[test]
+    fn format_overwrite_first_of_multiple_vcf() {
+        let setup = TestSetup::new(); // 1 sample
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Vcf);
+        let mut writer = writer.write_header(&setup.header).unwrap();
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        let enc = writer
+            .begin_record(&setup.contig, Pos1::new(100).unwrap(), &alleles, Some(30.0))
+            .unwrap()
+            .filter_pass();
+        let mut enc = enc.begin_samples();
+        setup.gt_fmt.encode(&mut enc, &[Genotype::unphased(0, 1)]).unwrap();
+        setup.dp_fmt.encode(&mut enc, &[45]).unwrap();
+        setup.gt_fmt.encode(&mut enc, &[Genotype::unphased(1, 1)]).unwrap(); // overwrite first
+        enc.emit().unwrap();
+        writer.finish().unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        let data_line = text.lines().find(|l| !l.starts_with('#')).unwrap();
+        let cols: Vec<&str> = data_line.split('\t').collect();
+        // In-place overwrite (htslib parity): GT keeps its original first column.
+        assert_eq!(cols[8], "GT:DP", "overwritten GT keeps its original position");
+        assert_eq!(cols[9], "1/1:45", "sample data follows the unchanged key order");
+    }
+
+    // r[verify record_encoder.format_dedup]
+    #[test]
+    fn format_overwrite_bcf() {
+        let setup = TestSetup::new(); // 1 sample
+        let mut buf = Vec::new();
+        let writer = Writer::new(&mut buf, OutputFormat::Bcf);
+        let mut writer = writer.write_header(&setup.header).unwrap();
+        let alleles = Alleles::snv(Base::A, Base::T).unwrap();
+        let enc = writer
+            .begin_record(&setup.contig, Pos1::new(100).unwrap(), &alleles, Some(30.0))
+            .unwrap()
+            .filter_pass();
+        let mut enc = enc.begin_samples();
+        setup.gt_fmt.encode(&mut enc, &[Genotype::unphased(0, 1)]).unwrap();
+        setup.dp_fmt.encode(&mut enc, &[45]).unwrap();
+        setup.dp_fmt.encode(&mut enc, &[99]).unwrap(); // overwrite
+        enc.emit().unwrap();
+        writer.finish().unwrap();
+
+        // Verify BCF is parseable by noodles and structurally correct.
+        // Value correctness is validated by format_overwrite_last_value_wins_vcf
+        // and the bcftools round-trip test in tests/vcf_bcftools_roundtrip.rs.
+        use noodles::bcf;
+        use noodles::vcf::variant::record::Samples as _;
+        let mut reader = bcf::io::Reader::new(std::io::Cursor::new(&buf));
+        let header = reader.read_header().unwrap();
+        let mut records = reader.record_bufs(&header);
+        let rec = records.next().unwrap().unwrap();
+        let keys: Vec<&str> = rec.samples().column_names(&header).map(|r| r.unwrap()).collect();
+        assert_eq!(
+            keys.iter().filter(|k| **k == "DP").count(),
+            1,
+            "BCF should have exactly one DP FORMAT key"
+        );
+    }
+}

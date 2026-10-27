@@ -1,0 +1,2345 @@
+//! Iterate over pileup columns. [`PileupEngine`] yields [`PileupColumn`]s with pre-extracted
+//! flat fields per active read. Supports per-position max-depth.
+//!
+//! Read filtering happens at fetch time via
+//! [`CustomizeRecordStore::filter`](crate::bam::record_store::CustomizeRecordStore::filter),
+//! not in this engine. Records that should not pollute the pileup never enter
+//! the store in the first place.
+
+use core::range::RangeInclusive;
+use seqair_types::{BamFlags, Base, BaseQuality, MappingQuality, Offset, Pos0, QPos};
+// Rc is used only for RefSeq (reference sequence), not for BAM records.
+use std::{num::NonZeroU32, ops::Range, rc::Rc};
+
+use crate::{reader::FetchCounts, utils::TraceErr};
+
+use super::{
+    cigar::{CigarCursor, CigarPosInfo, ClipFlanks, PlainGap},
+    record_idx::{RecordIdx, RecordRef},
+    record_store::{PileupInput, RecordStore},
+};
+
+/// Cloning is a pointer clone of the shared bases, so one `RefSeq` can drive
+/// several pileups over segments tiled inside its span.
+#[derive(Clone)]
+pub struct RefSeq {
+    bases: Rc<[Base]>,
+    start_pos: Pos0,
+}
+
+impl std::fmt::Debug for RefSeq {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefSeq")
+            .field("start_pos", &self.start_pos)
+            .field("len", &self.bases.len())
+            .finish()
+    }
+}
+
+impl RefSeq {
+    pub fn new(bases: Rc<[Base]>, start_pos: Pos0) -> Self {
+        Self { bases, start_pos }
+    }
+
+    /// 0-based reference position of the first base in the loaded window.
+    #[inline]
+    pub fn start_pos(&self) -> Pos0 {
+        self.start_pos
+    }
+
+    /// Number of bases loaded in this window.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.bases.len()
+    }
+
+    /// `true` if no bases are loaded.
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.bases.is_empty()
+    }
+
+    pub fn base_at(&self, pos: Pos0) -> Base {
+        let Some(offset) = pos.as_i64().checked_sub(self.start_pos.as_i64()) else {
+            return Base::Unknown;
+        };
+        if offset < 0 {
+            return Base::Unknown;
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "offset is non-negative (checked above) and bounded by reference sequence length; safe to cast on supported platforms"
+        )]
+        self.bases.get(offset as usize).copied().unwrap_or(Base::Unknown)
+    }
+
+    /// Look up a single base at `pos`. Returns `None` if `pos` falls outside
+    /// the loaded window. Use this when callers need to distinguish "outside
+    /// the loaded reference window" from "inside the window but `Base::Unknown`
+    /// (e.g. an `N` in the FASTA)" — [`base_at`](Self::base_at) collapses both
+    /// into `Base::Unknown`.
+    pub fn try_base_at(&self, pos: Pos0) -> Option<Base> {
+        let offset = pos.as_i64().checked_sub(self.start_pos.as_i64())?;
+        if offset < 0 {
+            return None;
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "offset is non-negative (checked above)"
+        )]
+        self.bases.get(offset as usize).copied()
+    }
+
+    /// Borrow `len` reference bases starting at `pos`. Returns `None` if any
+    /// position in `pos..pos+len` falls outside the loaded window.
+    ///
+    /// Unlike [`base_at`](Self::base_at), partial overlaps return `None`
+    /// rather than padding with `Base::Unknown`.
+    pub fn range(&self, pos: Pos0, len: u32) -> Option<&[Base]> {
+        let offset = pos.as_i64().checked_sub(self.start_pos.as_i64())?;
+        if offset < 0 {
+            return None;
+        }
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "offset is non-negative (checked above)"
+        )]
+        let start = offset as usize;
+        let end = start.checked_add(len as usize)?;
+        self.bases.get(start..end)
+    }
+}
+
+// r[impl pileup.active_set]
+// r[impl pileup.zero_refspan_reads]
+// r[impl pileup.soft_clip_at_position]
+// r[impl perf.no_sorted_indices]
+// r[impl perf.avoid_redundant_arena_get+2]
+// r[impl perf.cigar_no_to_vec]
+// r[impl perf.reuse_alignment_vec+3]
+// r[impl pileup.extras.generic_param]
+pub struct PileupEngine<U = ()> {
+    store: RecordStore<U>,
+    /// Alignment buffer reused across columns — cleared each call.
+    buf: Vec<PileupAlignment>,
+    current_pos: Pos0,
+    region_end: Pos0,
+    next_entry: usize,
+    /// Hot field: checked every column during retain. Stored separately so the
+    /// retain loop strides 4 bytes instead of the full `ActiveRecord` size (~144 bytes).
+    active_end_pos: Vec<Pos0>,
+    /// The smallest of `active_end_pos` (`Pos0::MAX` when empty). A column at
+    /// or below it evicts nothing, so the two `retain` scans are skipped —
+    /// most columns, since only about depth ÷ read length reads expire per column.
+    min_active_end: Pos0,
+    /// Cold fields: only accessed for records that survive retain.
+    active: Vec<ActiveRecord>,
+    max_depth: Option<NonZeroU32>,
+    ref_seq: Option<RefSeq>,
+    /// When > 0, emit up to this many soft-clipped fringe bases adjacent to each
+    /// alignment as [`PileupOp::SoftClip`] columns. 0 (default) = current
+    /// behavior (soft clips invisible), preserving htslib pileup parity.
+    soft_clip_overhang: u32,
+    // Profiling counters — u32 is sufficient for single-region pileups (max ~250M positions).
+    // For whole-genome streaming, these saturate at u32::MAX which is acceptable for debug output.
+    columns_produced: u32,
+    max_active_depth: u32,
+}
+
+/// Reusable scratch buffers for [`PileupEngine`], pooled across regions by
+/// [`Readers`](crate::reader::Readers) so each `pileup()` call doesn't
+/// reallocate them. The buffers are reused *within* a region (cleared per
+/// column); this additionally reuses them *between* regions, the same way the
+/// `RecordStore` is recovered by [`PileupGuard`].
+#[derive(Default)]
+pub(crate) struct PileupScratch {
+    buf: Vec<PileupAlignment>,
+    active_end_pos: Vec<Pos0>,
+    active: Vec<ActiveRecord>,
+}
+
+#[derive(Debug)]
+struct ActiveRecord {
+    record_idx: RecordIdx,
+    // r[impl perf.cigar_cursor]
+    cigar: CigarCursor,
+    /// Alignment start, for resolving soft-clip flanks on demand.
+    rec_pos: Pos0,
+    // Cached from SlimRecord to avoid store lookups in the hot loop
+    flags: BamFlags,
+    mapq: MappingQuality,
+    seq_len: u32,
+    /// Slab offsets of this read's bases and qualities, so a column resolves
+    /// its base without a dependent load of the `SlimRecord`.
+    bases_off: u32,
+    qual_off: u32,
+    matching_bases: u32,
+    indel_bases: u32,
+    // r[impl pileup.mate_link_cache]
+    /// Store index of the mate, `None` when unlinked.
+    mate_idx: Option<RecordIdx>,
+    /// The reference interval both mates cover, resolved once on activation so
+    /// the column loop only compares two positions. Empty when unlinked.
+    mate_overlap: Range<Pos0>,
+}
+
+// r[impl pileup.empty_seq_unknown_base]
+// Resolve the base + quality at `qpos` for a record on a Match/Insertion op.
+// Records with `SEQ=*` (`seq_len == 0`) have an empty bases/qual slab slice;
+// htslib's pileup keeps them in every covered column with base=N and the
+// missing-quality sentinel. We mirror that here by returning Unknown +
+// UNAVAILABLE so depth() and match_depth() stay in parity with htslib.
+fn base_qual_at<U>(
+    store: &RecordStore<U>,
+    active: &ActiveRecord,
+    qpos: QPos,
+) -> (Base, BaseQuality) {
+    // Past the read's own bases (which covers `SEQ=*`) is not another read's
+    // base: the slabs are shared, so check against the read's length.
+    if qpos.get() >= active.seq_len {
+        return (Base::Unknown, BaseQuality::UNAVAILABLE);
+    }
+    let q = qpos.as_usize();
+    store.base_qual_at_offsets(
+        (active.bases_off as usize).wrapping_add(q),
+        (active.qual_off as usize).wrapping_add(q),
+    )
+}
+
+/// Write one column entry per read of `actives` that has one at `pos`,
+/// starting at `spare[*written]`. Inlined into both of the engine's column
+/// loops — the uncapped one, and the capped one that calls it per pass — so
+/// the uncapped loop is exactly this loop and nothing else.
+#[inline(always)]
+fn fill_entries<U>(
+    actives: &mut [ActiveRecord],
+    store: &RecordStore<U>,
+    spare: &mut [std::mem::MaybeUninit<PileupAlignment>],
+    written: &mut usize,
+    pos: Pos0,
+    soft_clip_overhang: u32,
+    reference: Base,
+) -> Option<bool> {
+    // r[impl pileup.column_matches_reference]
+    let mut matches_reference = true;
+    let slab = store.cigar_slab();
+    let pos_u32 = pos.as_u32();
+    for active in actives {
+        // The common column first: inside an op, nothing anchored.
+        // Everything else takes the out-of-line step.
+        // Each path says whether its entry matches the reference while it
+        // still knows what it built: matching on the finished `op` instead
+        // costs ~10 instructions an entry.
+        let (op, indel_after) = if let Some(qpos) = active.cigar.plain_match(pos_u32) {
+            let (base, qual) = base_qual_at(store, active, qpos);
+            matches_reference &= base == reference;
+            (PileupOp::Match { qpos, base, qual }, Indel::None)
+        } else if let Some(gap) = active.cigar.plain_gap(pos_u32) {
+            matches_reference = false;
+            let op = match gap {
+                PlainGap::Deletion(del_len) => PileupOp::Deletion { del_len },
+                PlainGap::RefSkip => PileupOp::RefSkip,
+            };
+            (op, Indel::None)
+        } else {
+            let Some((info, deletion_after)) = active.cigar.step(slab, pos_u32) else {
+                // Outside the aligned span: emit a soft-clip fringe base if
+                // this column falls within the overhang window of a clip.
+                // The flanks are resolved here rather than kept per read:
+                // only the overhang's few columns either side ever ask.
+                // r[impl pileup.soft_clip_overhang.emit]
+                if soft_clip_overhang > 0
+                    && let Some(rec) = store.record(active.record_idx)
+                    && let Some(qpos) = ClipFlanks::new(active.rec_pos, rec.cigar(), active.seq_len)
+                        .qpos_at(pos, soft_clip_overhang)
+                {
+                    let (base, qual) = base_qual_at(store, active, qpos);
+                    matches_reference = false;
+                    let entry = PileupAlignment {
+                        op: PileupOp::SoftClip { qpos, base, qual },
+                        mapq: active.mapq,
+                        flags: active.flags,
+                        seq_len: active.seq_len,
+                        matching_bases: active.matching_bases,
+                        indel_bases: active.indel_bases,
+                        record_idx: active.record_idx,
+                        indel_after: Indel::None,
+                        mate_idx: active.mate_idx,
+                        in_mate_overlap: active.mate_overlap.contains(&pos),
+                    };
+                    spare
+                        .get_mut(*written)
+                        .trace_err("BUG: column entries outran the reserved capacity")?
+                        .write(entry);
+                    *written = written.checked_add(1).trace_err("BUG: column depth overflowed")?;
+                }
+                continue;
+            };
+            matches_reference &= deletion_after.is_none();
+            let op = match info {
+                CigarPosInfo::Match { qpos } => {
+                    let (base, qual) = base_qual_at(store, active, qpos);
+                    matches_reference &= base == reference;
+                    PileupOp::Match { qpos, base, qual }
+                }
+                CigarPosInfo::Insertion { qpos, insert_len } => {
+                    let (base, qual) = base_qual_at(store, active, qpos);
+                    matches_reference = false;
+                    PileupOp::Insertion { qpos, base, qual, insert_len }
+                }
+                CigarPosInfo::Deletion { del_len } => {
+                    matches_reference = false;
+                    PileupOp::Deletion { del_len }
+                }
+                // r[impl pileup_indel.complex_indel]
+                CigarPosInfo::ComplexIndel { del_len, insert_len, is_refskip } => {
+                    matches_reference = false;
+                    PileupOp::ComplexIndel { del_len, insert_len, is_refskip }
+                }
+                CigarPosInfo::RefSkip => {
+                    matches_reference = false;
+                    PileupOp::RefSkip
+                }
+            };
+            // Anchor-addressed indel (htslib `a.indel()` parity).
+            // Insertions are already encoded in the op; deletions are
+            // not (seqair emits `PileupOp::Deletion` at the deleted
+            // positions, not the anchor), so the cursor resolves them
+            // at the anchor Match column.
+            let indel_after = match op {
+                PileupOp::Insertion { insert_len, .. } => Indel::Insertion(insert_len),
+                PileupOp::Match { .. } => match deletion_after {
+                    Some(del_len) => Indel::Deletion(del_len),
+                    None => Indel::None,
+                },
+                PileupOp::Deletion { .. }
+                | PileupOp::ComplexIndel { .. }
+                | PileupOp::RefSkip
+                | PileupOp::SoftClip { .. } => Indel::None,
+            };
+            (op, indel_after)
+        };
+
+        let entry = PileupAlignment {
+            op,
+            mapq: active.mapq,
+            flags: active.flags,
+            seq_len: active.seq_len,
+            matching_bases: active.matching_bases,
+            indel_bases: active.indel_bases,
+            record_idx: active.record_idx,
+            indel_after,
+            // r[impl pileup.mate_link_cache]
+            mate_idx: active.mate_idx,
+            in_mate_overlap: active.mate_overlap.contains(&pos),
+        };
+        spare
+            .get_mut(*written)
+            .trace_err("BUG: column entries outran the reserved capacity")?
+            .write(entry);
+        *written = written.checked_add(1).trace_err("BUG: column depth overflowed")?;
+    }
+    Some(matches_reference)
+}
+
+// r[impl pileup.column_contents]
+// r[impl pileup.htslib_compat]
+// r[impl pileup.lending_iterator]
+/// A single pileup column, borrowing the record store and alignment
+/// buffer for the duration of its use.
+///
+/// Returned by [`PileupEngine::pileups`]. Valid until the next call to
+/// `pileups` on the same engine. Both the per-alignment data and the
+/// record store borrow from the engine, so the column cannot outlive
+/// the `pileups` call that produced it.
+///
+/// Access per-record extras or slab data (qname, aux, seq, qualities) via
+/// [`alignments`](Self::alignments), which yields [`AlignmentView`]
+/// wrappers, or via [`store`](Self::store) directly.
+pub struct PileupColumn<'eng, U = ()> {
+    pos: Pos0,
+    reference_base: Base,
+    matches_reference: bool,
+    alignments: &'eng [PileupAlignment],
+    store: &'eng RecordStore<U>,
+}
+
+impl<U> std::fmt::Debug for PileupColumn<'_, U> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PileupColumn")
+            .field("pos", &self.pos)
+            .field("reference_base", &self.reference_base)
+            .field("depth", &self.alignments.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<'eng, U> PileupColumn<'eng, U> {
+    #[must_use]
+    pub fn pos(&self) -> Pos0 {
+        self.pos
+    }
+
+    // r[impl pileup_indel.depth_includes_all]
+    #[must_use]
+    pub fn depth(&self) -> usize {
+        self.alignments.len()
+    }
+
+    /// Iterate alignments with store access for per-record extras, qname, aux,
+    /// seq, and qual.
+    ///
+    /// Each yielded [`AlignmentView`] derefs to [`PileupAlignment`] for the flat
+    /// per-position fields, and exposes [`extra`](AlignmentView::extra),
+    /// [`qname`](AlignmentView::qname), [`aux`](AlignmentView::aux),
+    /// [`seq`](AlignmentView::seq), and [`qualities`](AlignmentView::qualities) for slab data.
+    pub fn alignments(&self) -> impl Iterator<Item = AlignmentView<'_, 'eng, U>> + '_ {
+        let store = self.store;
+        // Deliberately does not resolve the record here. A consumer that only
+        // reads `op`/`mapq`/`flags` — the common case — would pay a touch of
+        // the records Vec per alignment per column for a `SlimRecord` it never
+        // looks at. `AlignmentView::record` resolves on demand instead.
+        self.alignments.iter().map(move |aln| AlignmentView { aln, store })
+    }
+
+    /// Iterate the raw alignments without store access.
+    pub fn raw_alignments(&self) -> impl Iterator<Item = &PileupAlignment> + '_ {
+        self.alignments.iter()
+    }
+
+    pub fn reference_base(&self) -> Base {
+        self.reference_base
+    }
+
+    // r[impl pileup.column_matches_reference]
+    /// True when every read here shows [`reference_base`](Self::reference_base)
+    /// as a [`PileupOp::Match`] with nothing inserted or deleted after it: the
+    /// column carries no evidence of anything but the reference.
+    ///
+    /// Known from building the column, so asking costs nothing; a caller that
+    /// drops such columns need not walk them to find out.
+    #[must_use]
+    pub fn matches_reference(&self) -> bool {
+        self.matches_reference
+    }
+
+    /// Borrow the record store for custom slab access (e.g., record fields by index).
+    pub fn store(&self) -> &'eng RecordStore<U> {
+        self.store
+    }
+
+    // r[impl pileup.records_overlapping]
+    /// Indices of the mapped records whose alignment overlaps `[start, end]`
+    /// (both inclusive), ascending — the same answer
+    /// [`PileupEngine::records_overlapping`] gives, reachable while this
+    /// column is alive. This is the entry point for a caller that decides at
+    /// a column that the surrounding region needs a second look and wants
+    /// the reads spanning it without letting go of the column.
+    ///
+    /// The indices address the engine's store, so they are the `record_idx`
+    /// values this and every later column report and stay valid for
+    /// [`find_record`](Self::find_record) on any of them. They mean nothing
+    /// once the engine's store has been reclaimed; see
+    /// [`PileupEngine::records_overlapping`].
+    pub fn records_overlapping(
+        &self,
+        start: Pos0,
+        end: Pos0,
+    ) -> impl Iterator<Item = RecordIdx> + 'eng {
+        self.store.records_overlapping_sorted(start, end)
+    }
+
+    /// Count of alignments with a query base at this position.
+    ///
+    /// Unlike [`depth`](Self::depth), deletions and ref-skips are not counted.
+    /// Use `match_depth` when you need the number of reads that actually cover
+    /// the position with a base (e.g., for allele frequency calculations).
+    ///
+    /// Note: when [`PileupEngine::set_soft_clip_overhang`] is enabled, this
+    /// includes projected [`PileupOp::SoftClip`] bases (which carry a real
+    /// query base). Subtract those with [`PileupAlignment::is_soft_clip`] if
+    /// you want the aligned-only base count.
+    #[must_use]
+    pub fn match_depth(&self) -> usize {
+        self.alignments.iter().filter(|a| a.qpos().is_some()).count()
+    }
+
+    // r[impl pileup.column_find_record]
+    // r[depends pileup.column_record_order]
+    /// The entry of `record_idx` in this column, or `None` when that record has
+    /// none here (it may not overlap the position, or the column may have been
+    /// truncated by `max_depth`).
+    ///
+    /// Binary search: the column is ordered by ascending `record_idx`. This is
+    /// how a consumer reaches the other mate of an overlapping pair
+    /// ([`PileupAlignment::mate_idx`]) while walking the column once.
+    #[must_use]
+    pub fn find_record(&self, record_idx: RecordIdx) -> Option<AlignmentView<'_, 'eng, U>> {
+        self.alignment_at(self.position_of(record_idx)?)
+    }
+
+    // r[impl pileup.column_position_of]
+    // r[depends pileup.column_record_order]
+    /// Where `record_idx` sits in this column, in the order
+    /// [`alignments`](Self::alignments) yields.
+    ///
+    /// The index, not the entry: a consumer that keeps its own per-column
+    /// scratch — one slot per alignment, filled as it walks — addresses that
+    /// scratch by position, and a mate reached through
+    /// [`PileupAlignment::mate_idx`] has to land in the same coordinates.
+    #[must_use]
+    pub fn position_of(&self, record_idx: RecordIdx) -> Option<usize> {
+        self.alignments.binary_search_by_key(&record_idx, |a| a.record_idx).ok()
+    }
+
+    // r[impl pileup.column_position_of]
+    /// The entry at `index` in this column's order, or `None` past its depth.
+    #[must_use]
+    pub fn alignment_at(&self, index: usize) -> Option<AlignmentView<'_, 'eng, U>> {
+        // `None` here means one thing only: `index` is past this column's
+        // depth. The record behind the entry is not in question — the engine
+        // minted its index from the store it still holds.
+        let aln = self.alignments.get(index)?;
+        Some(AlignmentView { aln, store: self.store })
+    }
+
+    // r[impl pileup.column_mate_of]
+    /// The linked mate of `view`, when it is also in this column.
+    ///
+    /// A consumer that deduplicates overlapping mates keeps one alignment per
+    /// fragment per column, but a fragment's evidence — an indel, a soft clip,
+    /// a repeat-terminal alignment — may be on the read it dropped. This
+    /// reaches that read without any I/O.
+    ///
+    /// The column is the frame, not the store: a mate that is linked but not
+    /// present here (aligned elsewhere, or dropped by `max_depth` truncation)
+    /// yields `None` rather than a read the caller cannot see the rest of.
+    ///
+    /// The relation is symmetric and irreflexive — each mate reaches the other
+    /// and neither reaches itself — so a pairwise rule gives the same answer
+    /// whichever mate the caller starts from.
+    ///
+    /// Deliberately an accessor and not a verdict. The `pair_indel` query this
+    /// replaces folded in a precedence rule ("the view's own indel wins"), which
+    /// no caller applying its own filters can use: a read may carry an indel
+    /// that the caller then rejects, and the mate has to stay reachable.
+    ///
+    /// Costs at most one binary search, and never perturbs column contents,
+    /// depth, or op emission.
+    #[must_use]
+    pub fn mate_of<'a>(
+        &'a self,
+        view: &AlignmentView<'a, 'eng, U>,
+    ) -> Option<AlignmentView<'a, 'eng, U>> {
+        // Cheap reject before the search: outside the pair's overlap the mate
+        // cannot be in this column.
+        if !view.in_mate_overlap() {
+            return None;
+        }
+        self.find_record(view.mate_idx()?)
+    }
+}
+
+/// A view over a single alignment in a column, with access to the record store.
+///
+/// Derefs to [`PileupAlignment`] so existing field and method access works
+/// unchanged. Adds [`extra`](Self::extra), [`qname`](Self::qname), and
+/// [`aux`](Self::aux) for data stored in the record store's slabs.
+// r[impl pileup.alignment_view]
+pub struct AlignmentView<'a, 'store, U> {
+    aln: &'a PileupAlignment,
+    store: &'store RecordStore<U>,
+}
+
+impl<U> std::fmt::Debug for AlignmentView<'_, '_, U> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AlignmentView").field("aln", &self.aln).finish_non_exhaustive()
+    }
+}
+
+impl<'a, 'store, U> AlignmentView<'a, 'store, U> {
+    // r[impl record_store.record_ref]
+    /// This alignment's record, resolved against the store.
+    ///
+    /// The view's own accessors cover the common fields; this is the way to
+    /// the rest of the record — its `end_pos`, its CIGAR, its mate — without a
+    /// second lookup.
+    pub fn record(&self) -> RecordRef<'store, U> {
+        self.store.record_at(self.aln.record_idx())
+    }
+
+    /// The per-record extra, as computed by the customize value's `compute` method.
+    pub fn extra(&self) -> &'store U {
+        self.record().extra()
+    }
+
+    /// The read's QNAME bytes in the store's name slab.
+    pub fn qname(&self) -> &'store [u8] {
+        self.record().qname()
+    }
+
+    // r[impl pileup.mate_link_cache]
+    // r[impl record_store.qname_hash.no_name+2]
+    /// The template's identity: the seed-fixed hash of the read's qname, shared
+    /// by both mates and stable across stores and runs. `None` when the record
+    /// carries no qname (a CRAM written with `RN=false`), which is also why a
+    /// consumer must not treat a missing hash as "one big fragment". See
+    /// [`qname_hash`](crate::bam::record_store::qname_hash).
+    ///
+    /// Resolved through the record rather than cached on the column entry: a
+    /// consumer asks for a fragment identity once per read it *keeps*, while
+    /// the entry is written once per read per column, so carrying it there
+    /// cost eight bytes of memory traffic per alignment to save a load here.
+    pub fn qname_hash(&self) -> Option<std::num::NonZeroU64> {
+        self.record().qname_hash()
+    }
+
+    /// The raw BAM aux bytes for this record.
+    pub fn aux(&self) -> &'store [u8] {
+        self.record().aux()
+    }
+
+    /// The read's full decoded sequence (all bases, not just the pileup position).
+    pub fn seq(&self) -> &'store [Base] {
+        self.record().seq()
+    }
+
+    /// The read's full per-base quality scores (all positions, not just the pileup position).
+    pub fn qualities(&self) -> &'store [BaseQuality] {
+        self.record().qual()
+    }
+
+    /// The inserted bases for a [`PileupOp::Insertion`] at this column — the
+    /// run `seq[qpos + 1 .. qpos + 1 + insert_len]`. Returns an empty slice for
+    /// every other op (including `ComplexIndel`, whose inserted run has no
+    /// anchor base in this column). Saves callers the manual `qpos + 1` slice
+    /// arithmetic into [`seq`](Self::seq).
+    pub fn inserted_bases(&self) -> &'store [Base] {
+        match self.aln.op {
+            PileupOp::Insertion { qpos, insert_len, .. } => {
+                inserted_run(self.seq(), qpos.get(), insert_len)
+            }
+            _ => &[],
+        }
+    }
+
+    /// The qualities of the [`inserted_bases`](Self::inserted_bases), aligned
+    /// one-to-one. Empty for non-insertion ops.
+    pub fn inserted_quals(&self) -> &'store [BaseQuality] {
+        match self.aln.op {
+            PileupOp::Insertion { qpos, insert_len, .. } => {
+                inserted_run(self.qualities(), qpos.get(), insert_len)
+            }
+            _ => &[],
+        }
+    }
+
+    /// The underlying [`PileupAlignment`] — use when you want to call
+    /// [`Clone::clone`] or otherwise escape the deref coercion.
+    pub fn alignment(&self) -> &'a PileupAlignment {
+        self.aln
+    }
+
+    /// The store this view references.
+    pub fn store(&self) -> &'store RecordStore<U> {
+        self.store
+    }
+}
+
+/// Slice the inserted run `full[qpos + 1 .. qpos + 1 + insert_len]`, returning
+/// an empty slice on any out-of-bounds index rather than panicking.
+#[inline]
+fn inserted_run<T>(full: &[T], qpos: u32, insert_len: u32) -> &[T] {
+    let start = (qpos as usize).saturating_add(1);
+    let end = start.saturating_add(insert_len as usize);
+    full.get(start..end).unwrap_or(&[])
+}
+
+impl<U> std::ops::Deref for AlignmentView<'_, '_, U> {
+    type Target = PileupAlignment;
+    fn deref(&self) -> &PileupAlignment {
+        self.aln
+    }
+}
+
+/// What a read shows at a specific reference position in the pileup.
+///
+/// `base`, `qual`, and `qpos` are only available for `Match` and `Insertion`
+/// variants — the type system prevents reading a base from a deletion.
+///
+/// Use the convenience accessors [`PileupAlignment::base`], [`PileupAlignment::qual`],
+/// and [`PileupAlignment::qpos`] when you only need one field, or match exhaustively
+/// when different ops need different handling:
+///
+/// ```
+/// use seqair::bam::pileup::PileupOp;
+///
+/// fn summarize(op: &PileupOp) -> &'static str {
+///     match op {
+///         PileupOp::Match { .. }        => "match",
+///         PileupOp::Insertion { .. }    => "insertion",
+///         PileupOp::Deletion { .. }     => "deletion",
+///         PileupOp::ComplexIndel { .. } => "complex-indel",
+///         PileupOp::RefSkip             => "ref-skip",
+///         PileupOp::SoftClip { .. }     => "soft-clip",
+///     }
+/// }
+///
+/// assert_eq!(summarize(&PileupOp::Match { qpos: seqair_types::QPos::new(10), base: seqair_types::Base::A, qual: seqair_types::BaseQuality::from_byte(30) }), "match");
+/// assert_eq!(summarize(&PileupOp::Deletion { del_len: 3 }), "deletion");
+/// assert_eq!(summarize(&PileupOp::ComplexIndel { del_len: 3, insert_len: 2, is_refskip: false }), "complex-indel");
+/// ```
+// r[impl pileup_indel.op_enum]
+// r[impl pileup_indel.type_safety]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PileupOp {
+    /// Read has a base aligned at this position (M, =, or X CIGAR op).
+    // r[impl types.base_quality.field_type]
+    Match { qpos: QPos, base: Base, qual: BaseQuality },
+    /// Read has a base aligned at this position AND an insertion of
+    /// `insert_len` query bases follows before the next reference position.
+    /// Access the inserted bases via
+    /// [`AlignmentView::inserted_bases`](AlignmentView::inserted_bases) (or
+    /// manually as the read's sequence at `qpos + 1 .. qpos + 1 + insert_len`).
+    /// NB: `qpos` here reports the matched base *preceding* the insertion — a
+    /// different frame from
+    /// [`AlignedPair::Insertion`](super::aligned_pairs::AlignedPair::Insertion),
+    /// whose `first_inserted` names the other end of that one-base gap.
+    // r[impl types.base_quality.field_type]
+    Insertion { qpos: QPos, base: Base, qual: BaseQuality, insert_len: u32 },
+    /// Read has a deletion spanning this position (D CIGAR op). `del_len` is the total length
+    /// of the D CIGAR op — how many reference bases are deleted. No query base.
+    Deletion { del_len: u32 },
+    /// Deletion or ref-skip at this position with a following insertion
+    /// (complex indel, e.g. D→I or N→I in CIGAR). Only emitted at the last
+    /// position of the D/N op. No query base exists at this position.
+    /// `is_refskip` distinguishes N→I (true) from D→I (false), matching
+    /// htslib where `is_del=true, is_refskip=true/false, indel>0` coexist.
+    // r[impl pileup_indel.complex_indel]
+    ComplexIndel { del_len: u32, insert_len: u32, is_refskip: bool },
+    /// Read has a reference skip at this position (N CIGAR op, e.g. intron). No query base.
+    RefSkip,
+    /// Read has a *soft-clipped* base projected onto this reference position.
+    /// The base is not aligned here — it is the clipped fringe base the engine
+    /// emits when `soft_clip_overhang > 0`, assuming a gapless extension past the
+    /// alignment boundary. Only ever produced opt-in; `base`/`qual`/`qpos`
+    /// behave like [`PileupOp::Match`].
+    SoftClip { qpos: QPos, base: Base, qual: BaseQuality },
+}
+
+const _: () = assert!(std::mem::size_of::<PileupOp>() <= 12, "PileupOp grew unexpectedly large");
+
+/// The indel immediately following a column's reference position for one read —
+/// the typed equivalent of htslib's signed `bam_pileup1_t::indel`.
+///
+/// Reported at the indel's *anchor* (the matched base just before the gap), so
+/// `Deletion` appears on the `PileupOp::Match` column before the deleted
+/// reference bases — NOT on the `PileupOp::Deletion` columns (which seqair
+/// emits at each deleted position). This lets a consumer collect one
+/// observation per indel at the position htslib would use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Indel {
+    /// No insertion or deletion follows this position for this read.
+    None,
+    /// An insertion of `n` query bases follows (`= htslib indel > 0`).
+    Insertion(u32),
+    /// A deletion of `n` reference bases follows (`= htslib indel < 0`).
+    Deletion(u32),
+}
+
+// r[impl pileup.qpos]
+// r[impl base_decode.alignment]
+// r[impl pileup_indel.op_enum]
+#[derive(Clone, Debug)]
+pub struct PileupAlignment {
+    record_idx: RecordIdx,
+    pub op: PileupOp,
+    // r[impl types.mapping_quality.field_type]
+    pub mapq: MappingQuality,
+    pub flags: BamFlags,
+    pub seq_len: u32,
+    pub matching_bases: u32,
+    pub indel_bases: u32,
+    /// The indel anchored at this column for this read (see [`Indel`]).
+    indel_after: Indel,
+    // r[impl pileup.mate_link_cache]
+    mate_idx: Option<RecordIdx>,
+    in_mate_overlap: bool,
+}
+
+// r[impl pileup_indel.accessors]
+impl PileupAlignment {
+    #[must_use]
+    pub fn record_idx(&self) -> RecordIdx {
+        self.record_idx
+    }
+
+    // r[impl pileup.mate_link_cache]
+    /// Store index of this read's mate, when
+    /// [`RecordStore::link_mates`](crate::bam::record_store::RecordStore::link_mates)
+    /// found both mates in the store. `None` for an unpaired, unlinked, or
+    /// secondary/supplementary alignment.
+    #[must_use]
+    pub fn mate_idx(&self) -> Option<RecordIdx> {
+        self.mate_idx
+    }
+
+    // r[impl record_store.fragment_idx]
+    /// The template this read belongs to, as a store index both mates share:
+    /// the lower of its own and its mate's. An unlinked read is its own; see
+    /// [`RecordRef::fragment_idx`](crate::bam::RecordRef::fragment_idx).
+    #[must_use]
+    pub fn fragment_idx(&self) -> RecordIdx {
+        self.mate_idx.map_or(self.record_idx, |mate| mate.min(self.record_idx))
+    }
+
+    // r[impl pileup.mate_link_cache]
+    /// True when this column's position is covered by both mates of the
+    /// template — the only positions at which a consumer needs to decide which
+    /// mate to keep.
+    #[must_use]
+    pub fn in_mate_overlap(&self) -> bool {
+        self.in_mate_overlap
+    }
+
+    #[must_use]
+    pub fn op(&self) -> &PileupOp {
+        &self.op
+    }
+
+    /// The indel anchored at this column for this read — the typed equivalent
+    /// of htslib's `a.indel()`. `Insertion`/`Deletion` appear only on the
+    /// anchor (the matched base before the gap); every other column is
+    /// [`Indel::None`].
+    #[must_use]
+    pub fn indel_after(&self) -> Indel {
+        self.indel_after
+    }
+
+    // r[impl pileup.qpos_none]
+    /// The read offset of the base at this column, if the read has one here.
+    ///
+    /// A [`QPos`], not a genomic position — see [`QPos`] for why the two are
+    /// separate types.
+    #[must_use]
+    pub fn qpos(&self) -> Option<QPos> {
+        match self.op {
+            PileupOp::Match { qpos, .. }
+            | PileupOp::Insertion { qpos, .. }
+            | PileupOp::SoftClip { qpos, .. } => Some(qpos),
+            PileupOp::Deletion { .. } | PileupOp::ComplexIndel { .. } | PileupOp::RefSkip => None,
+        }
+    }
+
+    #[must_use]
+    pub fn base(&self) -> Option<Base> {
+        match self.op {
+            PileupOp::Match { base, .. }
+            | PileupOp::Insertion { base, .. }
+            | PileupOp::SoftClip { base, .. } => Some(base),
+            PileupOp::Deletion { .. } | PileupOp::ComplexIndel { .. } | PileupOp::RefSkip => None,
+        }
+    }
+
+    #[must_use]
+    pub fn qual(&self) -> Option<BaseQuality> {
+        match self.op {
+            PileupOp::Match { qual, .. }
+            | PileupOp::Insertion { qual, .. }
+            | PileupOp::SoftClip { qual, .. } => Some(qual),
+            PileupOp::Deletion { .. } | PileupOp::ComplexIndel { .. } | PileupOp::RefSkip => None,
+        }
+    }
+
+    /// True when this column entry is an engine-projected soft-clipped fringe
+    /// base (see [`PileupOp::SoftClip`]), rather than an aligned base.
+    #[must_use]
+    pub fn is_soft_clip(&self) -> bool {
+        matches!(self.op, PileupOp::SoftClip { .. })
+    }
+
+    // r[impl pileup_indel.accessors]
+    #[must_use]
+    pub fn is_del(&self) -> bool {
+        matches!(self.op, PileupOp::Deletion { .. } | PileupOp::ComplexIndel { .. })
+    }
+
+    #[must_use]
+    pub fn is_refskip(&self) -> bool {
+        matches!(self.op, PileupOp::RefSkip | PileupOp::ComplexIndel { is_refskip: true, .. })
+    }
+
+    #[must_use]
+    pub fn insert_len(&self) -> u32 {
+        match self.op {
+            PileupOp::Insertion { insert_len, .. } | PileupOp::ComplexIndel { insert_len, .. } => {
+                insert_len
+            }
+            _ => 0,
+        }
+    }
+
+    /// Returns the deletion length for a `Deletion` or `ComplexIndel` op, or 0 for all other ops.
+    /// All positions within the same D CIGAR op report the same `del_len` (the total
+    /// D op length, not the remaining bases in the deletion).
+    // r[impl pileup_indel.accessors]
+    #[must_use]
+    pub fn del_len(&self) -> u32 {
+        match self.op {
+            PileupOp::Deletion { del_len } | PileupOp::ComplexIndel { del_len, .. } => del_len,
+            _ => 0,
+        }
+    }
+}
+
+impl<U> PileupEngine<U> {
+    // r[impl record_store.pileup_input]
+    /// Create a pileup engine that owns the record store.
+    ///
+    /// Takes a [`PileupInput`] rather than a [`RecordStore`] because the engine
+    /// relies on ascending position order and linked mates and checks neither:
+    /// an unsorted store loses whole reads without reporting a gap, and an
+    /// unlinked one makes every alignment look like it has no mate. Only
+    /// [`RecordStore::prepare_for_pileup`] mints that type.
+    ///
+    /// `region` is the closed interval of positions to report columns for.
+    // r[impl interval.span_type]
+    pub fn new(input: PileupInput<U>, region: RangeInclusive<Pos0>) -> Self {
+        Self::with_scratch(input, region, PileupScratch::default())
+    }
+
+    /// Build an engine reusing pooled scratch buffers. The buffers are cleared
+    /// (capacity retained) so no stale alignments leak from a previous region.
+    pub(crate) fn with_scratch(
+        input: PileupInput<U>,
+        region: RangeInclusive<Pos0>,
+        mut scratch: PileupScratch,
+    ) -> Self {
+        scratch.buf.clear();
+        scratch.active_end_pos.clear();
+        scratch.active.clear();
+        PileupEngine {
+            store: input.into_store(),
+            buf: scratch.buf,
+            current_pos: region.start,
+            region_end: region.last,
+            next_entry: 0,
+            active_end_pos: scratch.active_end_pos,
+            min_active_end: Pos0::MAX,
+            active: scratch.active,
+            max_depth: None,
+            ref_seq: None,
+            soft_clip_overhang: 0,
+            columns_produced: 0,
+            max_active_depth: 0,
+        }
+    }
+
+    /// Reclaim the scratch buffers (with capacity) for reuse by the next
+    /// region. Called by [`PileupGuard`]'s `Drop`.
+    pub(crate) fn take_scratch(&mut self) -> PileupScratch {
+        PileupScratch {
+            buf: std::mem::take(&mut self.buf),
+            active_end_pos: std::mem::take(&mut self.active_end_pos),
+            active: std::mem::take(&mut self.active),
+        }
+    }
+
+    pub fn set_reference_seq(&mut self, ref_seq: RefSeq) {
+        self.ref_seq = Some(ref_seq);
+    }
+
+    // r[impl pileup.max_depth]
+    // r[impl pileup.max_depth_per_position]
+    // r[impl pileup.max_depth.nonzero]
+    /// Cap how many alignments a column reports.
+    ///
+    /// `NonZeroU32`, because a cap of zero is not a cap — it is "emit no
+    /// alignments anywhere", which no caller wants and which a caller whose
+    /// own configuration spells "unlimited" as `0` would ask for by accident.
+    /// Leave it unset for no cap.
+    pub fn set_max_depth(&mut self, max: NonZeroU32) {
+        self.max_depth = Some(max);
+    }
+
+    /// Emit up to `overhang` soft-clipped fringe bases adjacent to each
+    /// alignment as [`PileupOp::SoftClip`] columns. `0` (default) restores the
+    /// htslib-parity behavior where soft clips are invisible. Used to recover
+    /// methylation evidence the aligner trimmed (e.g. a TAPS T over a `CpG` C).
+    // r[impl pileup.soft_clip_overhang.default_off]
+    pub fn set_soft_clip_overhang(&mut self, overhang: u32) {
+        self.soft_clip_overhang = overhang;
+    }
+
+    pub fn remaining_positions(&self) -> usize {
+        let diff = self
+            .region_end
+            .as_i64()
+            .checked_sub(self.current_pos.as_i64())
+            .and_then(|d| d.checked_add(1))
+            .unwrap_or(0);
+        #[expect(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "diff.max(0) is non-negative; bounded by region size which fits in usize on supported platforms"
+        )]
+        let r = diff.max(0) as usize;
+        r
+    }
+
+    /// Borrow the underlying `RecordStore` for qname lookups during iteration.
+    pub fn store(&self) -> &RecordStore<U> {
+        &self.store
+    }
+
+    // r[impl pileup.records_overlapping]
+    /// Indices of the mapped records whose alignment overlaps `[start, end]`
+    /// (both inclusive), ascending — the same answer
+    /// [`PileupInput::records_overlapping`] gives for the input this engine
+    /// was built from. The engine never reorders its store, so these are the
+    /// `record_idx` values its columns report, and they stay valid for
+    /// [`PileupColumn::find_record`] on any later column. Between columns
+    /// call this; while holding a column, which borrows the engine, use
+    /// [`PileupColumn::records_overlapping`] for the same answer.
+    ///
+    /// The indices are only meaningful while this engine holds the store.
+    /// Once [`reclaim_allocation`](Self::reclaim_allocation) — or the drop of
+    /// the [`PileupGuard`] that wraps the engine — has emptied it, this query
+    /// yields nothing, and indices collected earlier no longer name anything:
+    /// resolve them against [`store`](Self::store) before that point.
+    pub fn records_overlapping(
+        &self,
+        start: Pos0,
+        end: Pos0,
+    ) -> impl Iterator<Item = RecordIdx> + '_ {
+        self.store.records_overlapping_sorted(start, end)
+    }
+
+    /// Reclaim the store's heap allocation for the next region. Returns `None`
+    /// if it has already been reclaimed.
+    ///
+    /// **The returned store is empty.** Its slabs keep their capacity, which is
+    /// the entire point — the next region refills them without reallocating —
+    /// but the records are gone, so this is not a way to read the pileup's
+    /// input back. Use [`Self::store`] for that, before iteration ends.
+    ///
+    /// Call this after iteration when driving [`PileupEngine`] directly. The
+    /// [`PileupGuard`] wrapper does it on drop; prefer that path.
+    pub fn reclaim_allocation(&mut self) -> Option<RecordStore<U>> {
+        if self.store.is_empty() && self.store.records_capacity() == 0 {
+            return None;
+        }
+        let mut store = self.store.take_contents();
+        store.clear();
+        Some(store)
+    }
+}
+
+impl<U> std::fmt::Debug for PileupEngine<U> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PileupEngine")
+            .field("current_pos", &self.current_pos)
+            .field("region_end", &self.region_end)
+            .field("next_entry", &self.next_entry)
+            .field("active_count", &self.active.len())
+            .field("max_depth", &self.max_depth)
+            .field("columns_produced", &self.columns_produced)
+            .finish_non_exhaustive()
+    }
+}
+
+// r[impl pileup.extras.recover_store]
+/// RAII guard around a [`PileupEngine`] that returns the underlying
+/// [`RecordStore`] to a caller-provided slot when dropped.
+///
+/// Returned by [`Readers::pileup`](crate::reader::Readers::pileup). Derefs
+/// to the inner [`PileupEngine`], so all engine methods (`pileups`,
+/// `set_max_depth`, `store`, …) are available transparently. The point of
+/// the guard is that buffer recovery is automatic: drop the guard (end of
+/// scope, `break` out of the loop, `?`-propagated error mid-iteration)
+/// and the populated-then-cleared store is moved back into the slot,
+/// retaining its allocated capacity for the next pileup. Callers no
+/// longer need an explicit `recover_store` step.
+///
+/// The escape hatch is [`Self::into_inner`] — it consumes the guard
+/// without recovering the store, so the next
+/// [`Readers::pileup`](crate::reader::Readers::pileup) allocates a fresh
+/// store. Prefer letting the guard drop normally.
+///
+/// ⚠️ Because the guard [`Deref`](std::ops::Deref)s to [`PileupEngine`],
+/// [`PileupEngine::reclaim_allocation`] is reachable as `guard.reclaim_allocation()`.
+/// Calling it leaves the engine's store empty, and the guard's `Drop`
+/// finds nothing to recover — the next pileup allocates a fresh store.
+/// Use [`into_inner`](Self::into_inner) if you genuinely need to skip
+/// recovery.
+pub struct PileupGuard<'a, U = ()> {
+    /// `Some` for the lifetime of the guard, then taken to `None` by
+    /// [`Self::into_inner`] (so the `Drop` impl knows to skip recovery).
+    /// Using an `Option` avoids the `unsafe` `ManuallyDrop` + `ptr::read`
+    /// dance that an owning field would require.
+    engine: Option<PileupEngine<U>>,
+    slot: &'a mut RecordStore<U>,
+    /// Optional slot to recover the engine's scratch buffers into, so the next
+    /// region's pileup reuses them instead of allocating fresh. `None` for
+    /// guards that don't pool scratch (e.g. the fuzz harness).
+    scratch_slot: Option<&'a mut PileupScratch>,
+    fetch: FetchCounts,
+}
+
+impl<'a, U> PileupGuard<'a, U> {
+    /// Build a guard from a populated engine and the slots to recover into.
+    /// Used by [`Readers::pileup`] to wire up automatic store recovery (and,
+    /// when `scratch_slot` is `Some`, pooling of the engine's scratch buffers
+    /// across regions); `pub(crate)` because external callers should always go
+    /// through `Readers::pileup` to obtain one.
+    pub(crate) fn new(
+        engine: PileupEngine<U>,
+        slot: &'a mut RecordStore<U>,
+        scratch_slot: Option<&'a mut PileupScratch>,
+    ) -> Self {
+        Self { engine: Some(engine), slot, scratch_slot, fetch: FetchCounts::default() }
+    }
+
+    pub(crate) fn with_fetch_counts(mut self, fetch: FetchCounts) -> Self {
+        self.fetch = fetch;
+        self
+    }
+
+    // r[impl unified.pileup_fetch_counts]
+    /// What the fetch behind this pileup read: records overlapping the
+    /// segment, how many of them are mapped, and how many the customize
+    /// value kept. Records a load-time depth cap dropped count as fetched
+    /// and not kept.
+    pub fn fetch_counts(&self) -> FetchCounts {
+        self.fetch
+    }
+
+    /// Consume the guard and return the inner engine, **without**
+    /// recovering the store. Rare escape hatch — prefer letting the
+    /// guard drop normally.
+    ///
+    /// Note that the originating `Readers`' internal store slot is
+    /// already empty at this point (it was moved into the engine when
+    /// the guard was constructed), and `into_inner` does not put
+    /// anything back. The next call to
+    /// [`Readers::pileup`](crate::reader::Readers::pileup) on that
+    /// `Readers` will therefore allocate a fresh `RecordStore`. If you
+    /// want the engine for inspection without disabling recovery,
+    /// inspect through the guard via [`Deref`](std::ops::Deref) and
+    /// drop the guard normally instead.
+    pub fn into_inner(mut self) -> PileupEngine<U> {
+        self.engine.take().expect("engine present until into_inner is called")
+    }
+
+    fn engine_ref(&self) -> &PileupEngine<U> {
+        self.engine.as_ref().expect("engine present until guard is dropped or into_inner is called")
+    }
+
+    fn engine_mut(&mut self) -> &mut PileupEngine<U> {
+        self.engine.as_mut().expect("engine present until guard is dropped or into_inner is called")
+    }
+}
+
+impl<U> std::ops::Deref for PileupGuard<'_, U> {
+    type Target = PileupEngine<U>;
+    fn deref(&self) -> &PileupEngine<U> {
+        self.engine_ref()
+    }
+}
+
+impl<U> std::ops::DerefMut for PileupGuard<'_, U> {
+    fn deref_mut(&mut self) -> &mut PileupEngine<U> {
+        self.engine_mut()
+    }
+}
+
+impl<U> std::fmt::Debug for PileupGuard<'_, U> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PileupGuard").field("engine", &self.engine).finish_non_exhaustive()
+    }
+}
+
+impl<U> Drop for PileupGuard<'_, U> {
+    fn drop(&mut self) {
+        // Recover the store into the caller's slot. The engine is `None`
+        // only after [`PileupGuard::into_inner`], in which case recovery
+        // is intentionally skipped. `reclaim_allocation` further returns `None`
+        // if the store was already drained (edge case) or was empty with
+        // zero capacity from the start. In any of those cases, leave the
+        // slot untouched.
+        if let Some(mut engine) = self.engine.take() {
+            if let Some(store) = engine.reclaim_allocation() {
+                *self.slot = store;
+            }
+            if let Some(scratch_slot) = self.scratch_slot.take() {
+                *scratch_slot = engine.take_scratch();
+            }
+        }
+    }
+}
+
+// r[impl pileup.position_iteration]
+// r[impl interval.inclusive_ends]
+impl<U> PileupEngine<U> {
+    /// Core iteration logic for [`pileups`](Self::pileups).
+    ///
+    /// Clears `self.buf` and fills it with the alignments for the next
+    /// non-empty column. Returns `(pos, reference_base)` so the caller
+    /// can build a [`PileupColumn`] borrowing the buffer.
+    fn advance(&mut self) -> Option<(Pos0, Base, bool)> {
+        loop {
+            if self.current_pos > self.region_end {
+                return None;
+            }
+
+            let pos = self.current_pos;
+            self.current_pos = self
+                .current_pos
+                .checked_add_offset(Offset::new(1))
+                .trace_err("BUG: current_pos + 1 overflowed despite being <= region_end")?;
+
+            // Evict expired records — stable retain, preserves insertion order.
+            if pos > self.min_active_end {
+                // `retain` backshifts each survivor with one move. Compacting by
+                // `swap(write, read)` instead costs three moves of a 120-byte
+                // `ActiveRecord` for every survivor past the first eviction, which
+                // measured 7.8 % of a variant caller's worker CPU — more than the
+                // column entries the loop below exists to produce.
+                let Self { active, active_end_pos, min_active_end, .. } = self;
+                {
+                    let mut ends = active_end_pos.iter();
+                    active.retain(|_| ends.next().is_some_and(|end| *end >= pos));
+                }
+                let mut min_end = Pos0::MAX;
+                active_end_pos.retain(|&end| {
+                    let keep = end >= pos;
+                    if keep {
+                        min_end = min_end.min(end);
+                    }
+                    keep
+                });
+                *min_active_end = min_end;
+                debug_assert_eq!(active.len(), active_end_pos.len());
+            }
+
+            while self.next_entry < self.store.len() {
+                let idx =
+                    RecordIdx::from_usize(self.next_entry).trace_err("next_entry has no index")?;
+
+                // `idx < self.store.len()` by the loop condition, so this
+                // cannot miss; `break` rather than a panic if it ever does.
+                let Some(rec) = self.store.record(idx) else { break };
+                // With soft-clip overhang, a record becomes active `overhang`
+                // columns before its alignment start (to emit the leading clip
+                // partner) and stays active `overhang` columns past its end (for
+                // the trailing clip). `pos - overhang` is monotonic in `pos`, so
+                // the store's pos-sorted order remains valid.
+                // r[impl pileup.soft_clip_overhang.activation]
+                let overhang = self.soft_clip_overhang;
+                if rec.pos.as_i64() > pos.as_i64().saturating_add(i64::from(overhang)) {
+                    break;
+                }
+                self.next_entry =
+                    self.next_entry.checked_add(1).trace_err("next_entry exceeded usize::MAX")?;
+
+                if rec.end_pos.as_i64().saturating_add(i64::from(overhang)) < pos.as_i64() {
+                    continue;
+                }
+
+                // r[impl pileup.unmapped_excluded]
+                if rec.flags.is_unmapped() {
+                    continue;
+                }
+
+                let (ops_start, ops_end) = RecordStore::<U>::cigar_span(&rec);
+                let cigar = CigarCursor::new(rec.pos, ops_start, ops_end);
+
+                // Bake the trailing overhang into the eviction key so the retain
+                // loop keeps the record active through its trailing soft clip.
+                let active_end = match overhang {
+                    0 => rec.end_pos,
+                    n => rec
+                        .end_pos
+                        .checked_add_offset(Offset::new(i64::from(n)))
+                        .unwrap_or(Pos0::MAX),
+                };
+                // r[impl pileup.mate_link_cache]
+                // Widen by the overhang so a rescued soft-clip fringe base,
+                // which the engine projects up to `overhang` columns outside
+                // the alignment, still counts as being inside the pair's
+                // overlap — it is the same molecule either way. With the
+                // default overhang of 0 this is the store's interval verbatim.
+                let mate_overlap = rec.mate_overlap().map_or(Pos0::ZERO..Pos0::ZERO, |ov| {
+                    let offset = Offset::new(i64::from(overhang));
+                    let start = ov.start.checked_sub_offset(offset).unwrap_or(Pos0::ZERO);
+                    let end = ov.end.checked_add_offset(offset).unwrap_or(Pos0::MAX);
+                    start..end
+                });
+                // Build it before touching `self.active*`: `rec` borrows
+                // `self.store`, and the pushes need `&mut self`.
+                let (bases_off, qual_off) = RecordStore::<U>::seq_qual_offsets(&rec);
+                let active = ActiveRecord {
+                    record_idx: idx,
+                    cigar,
+                    rec_pos: rec.pos,
+                    flags: rec.flags,
+                    mapq: rec.mapq,
+                    seq_len: rec.seq_len,
+                    bases_off,
+                    qual_off,
+                    matching_bases: rec.matching_bases,
+                    indel_bases: rec.indel_bases,
+                    mate_idx: rec.mate_idx(),
+                    mate_overlap,
+                };
+                self.min_active_end = self.min_active_end.min(active_end);
+                self.active_end_pos.push(active_end);
+                self.active.push(active);
+            }
+
+            // r[impl pileup.empty_positions_skipped]
+            if self.active.is_empty() {
+                // r[impl pileup.trailing_empty_termination]
+                if self.next_entry >= self.store.len() {
+                    return None;
+                }
+                let next =
+                    RecordIdx::from_usize(self.next_entry).trace_err("next_entry has no index")?;
+                // Jump to the next record, but back up by the overhang so the
+                // leading soft-clip columns just before its alignment are not
+                // skipped.
+                let next_pos =
+                    self.store.record(next).trace_err("next_entry is not in the store")?.pos;
+                let next_start = match self.soft_clip_overhang {
+                    0 => next_pos,
+                    n => {
+                        next_pos.checked_sub_offset(Offset::new(i64::from(n))).unwrap_or(Pos0::ZERO)
+                    }
+                };
+                if next_start > self.current_pos {
+                    self.current_pos = next_start;
+                }
+                continue;
+            }
+
+            // r[impl pileup_indel.op_enum]
+            // r[impl pileup_indel.deletions_included]
+            // r[impl pileup_indel.refskips_included]
+            // r[related record_store.field_access]
+            // r[impl perf.reuse_alignment_vec+3]
+            // r[impl pileup.column_record_order]
+            // The active set is appended in store order and compacted stably on
+            // eviction, so walking it yields ascending record indices.
+            // r[impl perf.reuse_alignment_vec+3]
+            // One `reserve` for the whole column, then a straight write per
+            // entry. `Vec::push` cannot hoist its capacity compare — it may
+            // reallocate — so it repeats compare, store, len-update per read
+            // per column, which is 1.5 % of a variant caller's worker CPU for
+            // bookkeeping the loop already knows the answer to: at most one
+            // entry per active record.
+            // r[impl pileup.max_depth_per_position]
+            // The cap keeps the first `max` entries in column order, so the
+            // loop never visits the reads past it rather than building the
+            // rest of the column to truncate it — a deep amplicon column under
+            // a small cap would otherwise pay for every read it then drops.
+            // It walks the active set in passes, each taking as many reads as
+            // entries are still missing: almost every read yields one entry,
+            // so one pass is the rule, and a read that yields none (outside
+            // its span under a soft-clip overhang, or no reference span at
+            // all) only makes the next pass start where this one stopped.
+            // Keeping the test out of the per-read body leaves the uncapped
+            // loop exactly what it was. The reads it skips need no
+            // bookkeeping: their cursors catch up on the next column that asks.
+            let reference_base = self.ref_seq.as_ref().map_or(Base::Unknown, |r| r.base_at(pos));
+            let mut matches_reference = true;
+            let cap = self.max_depth.map_or(usize::MAX, |max| max.get() as usize);
+            self.buf.clear();
+            self.buf.reserve(self.active.len().min(cap));
+            let Self { buf, active: actives, store, soft_clip_overhang, .. } = self;
+            let soft_clip_overhang = *soft_clip_overhang;
+            let mut written = 0usize;
+            let spare = buf.spare_capacity_mut();
+            let n_active = actives.len();
+            if n_active <= cap {
+                matches_reference &= fill_entries(
+                    actives,
+                    store,
+                    spare,
+                    &mut written,
+                    pos,
+                    soft_clip_overhang,
+                    reference_base,
+                )?;
+            } else {
+                let mut pass_start = 0usize;
+                let mut pass_end = cap;
+                loop {
+                    let pass = actives.get_mut(pass_start..pass_end).unwrap_or_default();
+                    matches_reference &= fill_entries(
+                        pass,
+                        store,
+                        spare,
+                        &mut written,
+                        pos,
+                        soft_clip_overhang,
+                        reference_base,
+                    )?;
+                    if written >= cap || pass_end >= n_active {
+                        break;
+                    }
+                    pass_start = pass_end;
+                    pass_end = pass_end.saturating_add(cap.saturating_sub(written)).min(n_active);
+                }
+            }
+            debug_assert!(written <= cap, "wrote past the depth cap");
+            debug_assert!(written <= self.buf.capacity(), "wrote past the reserve");
+            // SAFETY: the loop writes each of `written` slots before advancing
+            // past it, and `get_mut` above has refused every index outside the
+            // reserve, so the first `written` elements are initialised. Leaving
+            // early through `?` leaves the length at 0, which is also sound:
+            // spare capacity is never read and never dropped.
+            unsafe { self.buf.set_len(written) };
+
+            if !self.buf.is_empty() {
+                self.columns_produced = self.columns_produced.saturating_add(1);
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "depth is bounded by max_depth (u32) or typical pileup sizes; saturates at u32::MAX for profiling"
+                )]
+                let depth_u32 = self.buf.len() as u32;
+                self.max_active_depth = self.max_active_depth.max(depth_u32);
+                return Some((pos, reference_base, matches_reference));
+            }
+        }
+    }
+
+    // r[impl pileup.lending_iterator]
+    /// Advance to the next pileup column.
+    ///
+    /// Returns `Some(PileupColumn<'_, U>)` borrowing the engine's record store
+    /// and alignment buffer. Call this in a `while let` loop. The column is
+    /// valid until the next call to `pileups` on the same engine.
+    ///
+    /// This is a lending iterator — the returned column borrows from the engine,
+    /// so it cannot be collected into a `Vec` or held across subsequent
+    /// `pileups` calls. Extract primitive data (pos, depth, etc.) if you need
+    /// to retain it.
+    pub fn pileups(&mut self) -> Option<PileupColumn<'_, U>> {
+        let (pos, reference_base, matches_reference) = self.advance()?;
+        Some(PileupColumn {
+            pos,
+            reference_base,
+            matches_reference,
+            alignments: &self.buf,
+            store: &self.store,
+        })
+    }
+
+    /// Remaining positions in the current region — lower-bound estimate for
+    /// pre-allocation of result vectors.
+    pub fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, Some(self.remaining_positions()))
+    }
+}
+
+impl<U> Drop for PileupEngine<U> {
+    fn drop(&mut self) {
+        if self.columns_produced > 0 {
+            tracing::debug!(
+                target: super::region_buf::PROFILE_TARGET,
+                columns = self.columns_produced,
+                max_depth = self.max_active_depth,
+                active_cap = self.active.capacity().saturating_add(self.active_end_pos.capacity()),
+                "pileup_engine",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::arithmetic_side_effects, reason = "test arithmetic on known small values")]
+mod tests {
+    use super::*;
+    use crate::bam::MateFields;
+    use crate::bam::test_util::tid;
+
+    /// The closed region `first..=last`, the shape `PileupEngine::new` takes.
+    fn region(first: u32, last: u32) -> RangeInclusive<Pos0> {
+        RangeInclusive { start: Pos0::new(first).unwrap(), last: Pos0::new(last).unwrap() }
+    }
+
+    #[test]
+    fn ref_seq_base_at_within_range() {
+        let ref_seq =
+            RefSeq::new(Rc::from([Base::A, Base::C, Base::G, Base::T]), Pos0::new(100).unwrap());
+        assert_eq!(ref_seq.base_at(Pos0::new(100).unwrap()), Base::A);
+        assert_eq!(ref_seq.base_at(Pos0::new(101).unwrap()), Base::C);
+        assert_eq!(ref_seq.base_at(Pos0::new(102).unwrap()), Base::G);
+        assert_eq!(ref_seq.base_at(Pos0::new(103).unwrap()), Base::T);
+    }
+
+    #[test]
+    fn ref_seq_base_at_before_start() {
+        let ref_seq = RefSeq::new(Rc::from([Base::A, Base::C]), Pos0::new(100).unwrap());
+        assert_eq!(ref_seq.base_at(Pos0::new(99).unwrap()), Base::Unknown);
+        assert_eq!(ref_seq.base_at(Pos0::new(0).unwrap()), Base::Unknown);
+    }
+
+    #[test]
+    fn ref_seq_base_at_after_end() {
+        let ref_seq = RefSeq::new(Rc::from([Base::A, Base::C]), Pos0::new(100).unwrap());
+        assert_eq!(ref_seq.base_at(Pos0::new(102).unwrap()), Base::Unknown);
+        assert_eq!(ref_seq.base_at(Pos0::new(1000).unwrap()), Base::Unknown);
+    }
+
+    #[test]
+    fn ref_seq_base_at_empty() {
+        let ref_seq = RefSeq::new(Rc::from([]), Pos0::new(100).unwrap());
+        assert_eq!(ref_seq.base_at(Pos0::new(100).unwrap()), Base::Unknown);
+    }
+
+    // r[verify perf.reuse_alignment_vec+3]
+    /// The internal buffer must retain capacity across columns so the
+    /// engine doesn't keep re-allocating.
+    #[test]
+    fn internal_buf_retains_capacity() {
+        use crate::bam::cigar::{CigarOp, CigarOpType};
+        use seqair_types::{BamFlags, Base};
+
+        let mut store = RecordStore::new();
+        store
+            .push_fields(
+                Pos0::new(100).unwrap(),
+                Pos0::new(104).unwrap(),
+                BamFlags::empty(),
+                MappingQuality::from_byte(30),
+                5,
+                0,
+                b"read1",
+                &[CigarOp::new(CigarOpType::Match, 5)],
+                &[Base::A; 5],
+                &[40; 5],
+                &[],
+                Some(tid(0)),
+                MateFields::default(),
+                &mut (),
+            )
+            .unwrap();
+
+        let mut engine = PileupEngine::new(store.prepare_for_pileup().input, region(100, 104));
+
+        // First column — buf grows to accommodate alignments.
+        let depth = engine.pileups().unwrap().depth();
+        assert!(depth > 0, "should have at least one alignment");
+        let cap_after_first = engine.buf.capacity();
+        assert!(cap_after_first > 0, "buffer should have allocated");
+
+        // Second column — same buffer, capacity must be retained.
+        assert!(engine.pileups().is_some());
+        assert_eq!(engine.buf.capacity(), cap_after_first, "buffer capacity retained across calls");
+    }
+
+    // r[verify pileup.column_record_order]
+    /// After eviction of expired records, survivors must remain in insertion order.
+    /// With the old `swap_remove` eviction, removing the shortest-lived record would
+    /// swap in the last record, scrambling the order (e.g. [0,1,2,3,4] → [4,1,2,3]).
+    /// Stable retain keeps them in order ([1,2,3,4]).
+    #[test]
+    fn eviction_preserves_insertion_order() {
+        use crate::bam::cigar::{CigarOp, CigarOpType};
+        use seqair_types::{BamFlags, Base};
+
+        let mut store = RecordStore::new();
+
+        // 5 records at pos=0 with spans 10, 20, 30, 40, 50.
+        // Record 0 (span 10) covers [0,9], record 1 (span 20) covers [0,19], etc.
+        // At pos=10, record 0 is evicted. Old swap_remove would have moved record 4
+        // into slot 0; stable retain keeps 1,2,3,4 in insertion order.
+        for (i, span) in [10u32, 20, 30, 40, 50].iter().enumerate() {
+            let end = span.saturating_sub(1);
+            store
+                .push_fields(
+                    Pos0::new(0).unwrap(),
+                    Pos0::new(end).unwrap(),
+                    BamFlags::empty(),
+                    MappingQuality::from_byte(30),
+                    *span,
+                    0,
+                    format!("read{i}").as_bytes(),
+                    &[CigarOp::new(CigarOpType::Match, *span)],
+                    &vec![Base::A; *span as usize],
+                    &vec![40u8; *span as usize],
+                    &[],
+                    Some(tid(0)),
+                    MateFields::default(),
+                    &mut (),
+                )
+                .unwrap();
+        }
+
+        let mut engine = PileupEngine::new(store.prepare_for_pileup().input, region(0, 49));
+
+        let mut columns = Vec::new();
+        while let Some(col) = engine.pileups() {
+            let indices: Vec<u32> = col.alignments().map(|a| a.record_idx().get()).collect();
+            columns.push((col.pos(), indices));
+        }
+
+        // Pre-eviction: pos 5 — all 5 records in insertion order
+        let at_5 = columns.iter().find(|(p, _)| *p == Pos0::new(5).unwrap()).unwrap();
+        assert_eq!(at_5.1, vec![0, 1, 2, 3, 4]);
+
+        // After first eviction (record 0 expired at pos=10): pos 15 — [1,2,3,4]
+        let at_15 = columns.iter().find(|(p, _)| *p == Pos0::new(15).unwrap()).unwrap();
+        assert_eq!(at_15.1, vec![1, 2, 3, 4]);
+
+        // After second eviction (record 1 expired at pos=20): pos 25 — [2,3,4]
+        let at_25 = columns.iter().find(|(p, _)| *p == Pos0::new(25).unwrap()).unwrap();
+        assert_eq!(at_25.1, vec![2, 3, 4]);
+
+        // After third eviction (record 2 expired at pos=30): pos 35 — [3,4]
+        let at_35 = columns.iter().find(|(p, _)| *p == Pos0::new(35).unwrap()).unwrap();
+        assert_eq!(at_35.1, vec![3, 4]);
+
+        // After fourth eviction (record 3 expired at pos=40): pos 45 — [4]
+        let at_45 = columns.iter().find(|(p, _)| *p == Pos0::new(45).unwrap()).unwrap();
+        assert_eq!(at_45.1, vec![4]);
+    }
+
+    // r[verify pileup.soft_clip_overhang.activation]
+    // r[verify pileup.soft_clip_overhang.emit]
+    #[test]
+    fn soft_clip_overhang_emits_fringe_partner() {
+        use crate::bam::cigar::{CigarOp, CigarOpType};
+        use seqair_types::{BamFlags, Base};
+
+        // 2S 5M 2S at pos 100: leading clip bases [C,T] at query 0..2, match at
+        // ref 100..=104 (query 2..7), trailing clip [G,C] at query 7..9. With
+        // overhang 1, the engine should emit one SoftClip column at pos 99 (the
+        // leading partner, query 1 = T) and one at pos 105 (the trailing
+        // partner, query 7 = G).
+        let seq = [Base::C, Base::T, Base::A, Base::A, Base::A, Base::A, Base::A, Base::G, Base::C];
+        let quals = [10u8, 11, 40, 40, 40, 40, 40, 12, 13];
+        let mut store = RecordStore::new();
+        store
+            .push_fields(
+                Pos0::new(100).unwrap(),
+                Pos0::new(104).unwrap(),
+                BamFlags::empty(),
+                MappingQuality::from_byte(30),
+                5,
+                0,
+                b"clip_read",
+                &[
+                    CigarOp::new(CigarOpType::SoftClip, 2),
+                    CigarOp::new(CigarOpType::Match, 5),
+                    CigarOp::new(CigarOpType::SoftClip, 2),
+                ],
+                &seq,
+                &quals,
+                &[],
+                Some(tid(0)),
+                MateFields::default(),
+                &mut (),
+            )
+            .unwrap();
+
+        let mut engine = PileupEngine::new(store.prepare_for_pileup().input, region(98, 107));
+        engine.set_soft_clip_overhang(1);
+
+        let mut soft: Vec<(u32, u32, Base)> = Vec::new();
+        let mut positions: Vec<u32> = Vec::new();
+        while let Some(col) = engine.pileups() {
+            positions.push(u32::from(col.pos()));
+            for aln in col.alignments() {
+                if aln.is_soft_clip() {
+                    soft.push((
+                        u32::from(col.pos()),
+                        aln.qpos().unwrap().get(),
+                        aln.base().unwrap(),
+                    ));
+                }
+            }
+        }
+
+        assert_eq!(
+            soft,
+            vec![(99, 1, Base::T), (105, 7, Base::G)],
+            "exactly the two fringe partners, in coordinate order"
+        );
+        // No spurious empty column at pos 98 (record activates early but has no
+        // base there).
+        assert!(!positions.contains(&98), "no column before the leading partner");
+        assert!(!positions.contains(&106), "trailing clip beyond overhang not emitted");
+    }
+
+    // r[verify pileup.soft_clip_overhang.default_off]
+    #[test]
+    fn soft_clip_overhang_zero_is_invisible() {
+        use crate::bam::cigar::{CigarOp, CigarOpType};
+        use seqair_types::{BamFlags, Base};
+
+        let seq = [Base::C, Base::A, Base::A, Base::A, Base::A, Base::A];
+        let mut store = RecordStore::new();
+        store
+            .push_fields(
+                Pos0::new(100).unwrap(),
+                Pos0::new(104).unwrap(),
+                BamFlags::empty(),
+                MappingQuality::from_byte(30),
+                5,
+                0,
+                b"clip_read",
+                &[CigarOp::new(CigarOpType::SoftClip, 1), CigarOp::new(CigarOpType::Match, 5)],
+                &seq,
+                &[40u8; 6],
+                &[],
+                Some(tid(0)),
+                MateFields::default(),
+                &mut (),
+            )
+            .unwrap();
+
+        let mut engine = PileupEngine::new(store.prepare_for_pileup().input, region(98, 106));
+        // Default overhang 0: behaves exactly as before, no SoftClip columns.
+        let mut positions: Vec<u32> = Vec::new();
+        while let Some(col) = engine.pileups() {
+            positions.push(u32::from(col.pos()));
+            assert!(col.alignments().all(|a| !a.is_soft_clip()));
+        }
+        assert_eq!(positions, vec![100, 101, 102, 103, 104]);
+    }
+
+    /// Property tests for the opt-in soft-clip overhang mode. The headline
+    /// invariant is `r[pileup.soft_clip_overhang.additive]`: enabling the
+    /// overhang only *adds* `SoftClip` entries and never perturbs the aligned
+    /// column stream a baseline (overhang-0) run produces.
+    mod overhang_properties {
+        use super::super::*;
+        use super::region;
+        use crate::bam::cigar::{CigarOp, CigarOpType};
+        use hegel::prelude::*;
+        use seqair_types::{BamFlags, Base};
+
+        const BASES: [Base; 4] = [Base::A, Base::C, Base::G, Base::T];
+
+        #[derive(Clone, Debug)]
+        struct ReadSpec {
+            pos: u32,
+            lead: u32,
+            a: u32,
+            d: u32,
+            b: u32,
+            trail: u32,
+            seq: Vec<Base>,
+        }
+
+        impl ReadSpec {
+            fn ref_span(&self) -> u32 {
+                self.a + self.d + self.b
+            }
+            fn aln_start(&self) -> u32 {
+                self.pos
+            }
+            fn aln_end(&self) -> u32 {
+                self.pos + self.ref_span()
+            }
+            fn cigar(&self) -> Vec<CigarOp> {
+                let mut ops = Vec::new();
+                if self.lead > 0 {
+                    ops.push(CigarOp::new(CigarOpType::SoftClip, self.lead));
+                }
+                ops.push(CigarOp::new(CigarOpType::Match, self.a));
+                if self.d > 0 {
+                    ops.push(CigarOp::new(CigarOpType::Deletion, self.d));
+                    ops.push(CigarOp::new(CigarOpType::Match, self.b));
+                }
+                if self.trail > 0 {
+                    ops.push(CigarOp::new(CigarOpType::SoftClip, self.trail));
+                }
+                ops
+            }
+        }
+
+        #[hegel::composite]
+        fn read_spec(tc: &TestCase) -> ReadSpec {
+            let pos = tc.draw_silent(gs::integers::<u32>().min_value(50).max_value(149));
+            let lead = tc.draw_silent(gs::integers::<u32>().max_value(3));
+            let has_del = tc.draw_silent(gs::booleans());
+            let a = tc.draw_silent(gs::integers::<u32>().min_value(1).max_value(5));
+            let trail = tc.draw_silent(gs::integers::<u32>().max_value(3));
+            let (d, b) = if has_del {
+                (
+                    tc.draw_silent(gs::integers::<u32>().min_value(1).max_value(3)),
+                    tc.draw_silent(gs::integers::<u32>().min_value(1).max_value(5)),
+                )
+            } else {
+                (0, 0)
+            };
+            let qlen = (lead + a + b + trail) as usize;
+            let seq = (0..qlen).map(|_| tc.draw_silent(gs::sampled_from(&BASES))).collect();
+            ReadSpec { pos, lead, a, d, b, trail, seq }
+        }
+
+        const KIND_MATCH: u8 = 0;
+        const KIND_INS: u8 = 1;
+        const KIND_DEL: u8 = 2;
+        const KIND_COMPLEX: u8 = 3;
+        const KIND_REFSKIP: u8 = 4;
+
+        struct RunResult {
+            /// Sorted `(pos, record_idx, kind, qpos)` for every non-`SoftClip` op.
+            aligned: Vec<(u32, u32, u8, i64)>,
+            /// `(pos, record_idx, qpos)` for every `SoftClip` op.
+            softclips: Vec<(u32, u32, i64)>,
+            softclips_valid: bool,
+            min_depth: usize,
+            saw_column: bool,
+        }
+
+        fn run_engine(reads: &[ReadSpec], overhang: u32) -> RunResult {
+            // The engine requires records in coordinate (`pos`) order; the
+            // generator does not, so sort before loading. `record_idx` then
+            // refers to this sorted order.
+            let mut reads = reads.to_vec();
+            reads.sort_by_key(|r| r.pos);
+            let reads = &reads;
+
+            let mut store = RecordStore::<()>::new();
+            for (i, r) in reads.iter().enumerate() {
+                let quals = vec![40u8; r.seq.len()];
+                store
+                    .push_fields(
+                        Pos0::new(r.pos).unwrap(),
+                        Pos0::new(r.aln_end() - 1).unwrap(),
+                        BamFlags::empty(),
+                        MappingQuality::from_byte(60),
+                        r.a + r.b,
+                        0,
+                        format!("r{i}").as_bytes(),
+                        &r.cigar(),
+                        &r.seq,
+                        &quals,
+                        &[],
+                        Some(crate::bam::test_util::tid(0)),
+                        crate::bam::MateFields::default(),
+                        &mut (),
+                    )
+                    .unwrap();
+            }
+
+            let mut engine = PileupEngine::new(store.prepare_for_pileup().input, region(0, 220));
+            engine.set_soft_clip_overhang(overhang);
+
+            let mut aligned = Vec::new();
+            let mut softclips = Vec::new();
+            let mut softclips_valid = true;
+            let mut min_depth = usize::MAX;
+            let mut saw_column = false;
+
+            while let Some(col) = engine.pileups() {
+                saw_column = true;
+                min_depth = min_depth.min(col.depth());
+                let pos = u32::from(col.pos());
+                for aln in col.alignments() {
+                    let rec = aln.record_idx().get();
+                    match aln.op {
+                        PileupOp::Match { qpos, .. } => {
+                            aligned.push((pos, rec, KIND_MATCH, i64::from(qpos.get())));
+                        }
+                        PileupOp::Insertion { qpos, .. } => {
+                            aligned.push((pos, rec, KIND_INS, i64::from(qpos.get())));
+                        }
+                        PileupOp::Deletion { .. } => aligned.push((pos, rec, KIND_DEL, -1)),
+                        PileupOp::ComplexIndel { .. } => {
+                            aligned.push((pos, rec, KIND_COMPLEX, -1));
+                        }
+                        PileupOp::RefSkip => aligned.push((pos, rec, KIND_REFSKIP, -1)),
+                        PileupOp::SoftClip { qpos, base, .. } => {
+                            softclips.push((pos, rec, i64::from(qpos.get())));
+                            let r = &reads[rec as usize];
+                            let qpos = qpos.as_usize();
+                            // Base must be the actual clipped SEQ base.
+                            if r.seq.get(qpos).copied() != Some(base) {
+                                softclips_valid = false;
+                            }
+                            // Position must be within `overhang` of a boundary.
+                            let in_lead = pos < r.aln_start()
+                                && r.aln_start() - pos <= overhang
+                                && r.lead > 0;
+                            let in_trail =
+                                pos >= r.aln_end() && pos - r.aln_end() < overhang && r.trail > 0;
+                            if !(in_lead || in_trail) {
+                                softclips_valid = false;
+                            }
+                        }
+                    }
+                }
+            }
+
+            aligned.sort_unstable();
+            if min_depth == usize::MAX {
+                min_depth = 0;
+            }
+            RunResult { aligned, softclips, softclips_valid, min_depth, saw_column }
+        }
+
+        // r[verify pileup.soft_clip_overhang.additive]
+        // r[verify pileup.soft_clip_overhang.default_off]
+        // r[verify pileup.soft_clip_overhang.emit]
+        #[hegel::test]
+        fn overhang_only_adds_soft_clips(tc: TestCase) {
+            let reads = tc.draw(gs::vecs(read_spec().print_as_debug()).min_size(1).max_size(5));
+            let overhang = tc.draw(gs::integers::<u32>().min_value(1).max_value(3));
+
+            let baseline = run_engine(&reads, 0);
+            let with_oh = run_engine(&reads, overhang);
+
+            // Baseline never produces soft clips.
+            assert!(baseline.softclips.is_empty());
+
+            // The aligned column stream is byte-identical with the overhang on.
+            assert_eq!(&with_oh.aligned, &baseline.aligned);
+
+            // Every emitted soft clip references a real clipped SEQ base inside
+            // the overhang window.
+            assert!(with_oh.softclips_valid);
+
+            // No empty columns are ever emitted.
+            if with_oh.saw_column {
+                assert!(with_oh.min_depth >= 1);
+            }
+        }
+    }
+
+    // r[verify pileup.soft_clip_overhang.activation]
+    // r[verify pileup.soft_clip_overhang.emit]
+    #[test]
+    fn soft_clip_active_end_overflow_near_i32_max() {
+        // When end_pos + overhang exceeds i32::MAX, the record must still stay
+        // active through the end of the contig — not silently fall back to its
+        // natural end_pos (which would drop trailing clip columns).
+        use crate::bam::cigar::{CigarOp, CigarOpType};
+        use seqair_types::{BamFlags, Base};
+
+        let max_pos = i32::MAX as u32;
+        // pos=i32::MAX-4, 3 matches → end_pos=i32::MAX-2, trailing clip=3.
+        // overhang=3 → active_end needs (i32::MAX-2)+3 = i32::MAX+1 → overflow.
+        // With the fix, active_end = max_value (i32::MAX); without it would
+        // silently fall back to end_pos=i32::MAX-2 and the trailing clip at
+        // i32::MAX-1 would be dropped.
+        //
+        // Note: the engine cannot emit position i32::MAX itself (current_pos+1
+        // overflows before the column is built — a pre-existing edge), so we
+        // verify the trailing clip at i32::MAX-1, the highest processable column
+        // where active_end overflow matters.
+        let pos = max_pos - 4;
+        let seq = [Base::A, Base::A, Base::A, Base::T, Base::C, Base::G];
+        let quals = [40u8; 6];
+        let mut store = RecordStore::new();
+        store
+            .push_fields(
+                Pos0::new(pos).unwrap(),
+                Pos0::new(pos + 2).unwrap(), // end_pos = i32::MAX - 2
+                BamFlags::empty(),
+                MappingQuality::from_byte(60),
+                3,
+                0,
+                b"edge_read",
+                &[CigarOp::new(CigarOpType::Match, 3), CigarOp::new(CigarOpType::SoftClip, 3)],
+                &seq,
+                &quals,
+                &[],
+                Some(tid(0)),
+                MateFields::default(),
+                &mut (),
+            )
+            .unwrap();
+
+        // region last <= i32::MAX - 1
+        let mut engine =
+            PileupEngine::new(store.prepare_for_pileup().input, region(max_pos - 5, max_pos - 1));
+        engine.set_soft_clip_overhang(3);
+
+        let mut trailing: Vec<(u32, Base)> = Vec::new();
+        while let Some(col) = engine.pileups() {
+            for aln in col.alignments() {
+                if aln.is_soft_clip() {
+                    trailing.push((u32::from(col.pos()), aln.base().unwrap()));
+                }
+            }
+        }
+
+        // Trailing clip: 3bp clip at aln_end=i32::MAX-1, overhang=3.
+        // Position i32::MAX-1 (d=0, qpos=query_offset+match_len+0=3): Base::T.
+        assert_eq!(trailing, vec![(max_pos - 1, Base::T)]);
+    }
+
+    // r[verify pileup.soft_clip_overhang.activation]
+    // r[verify pileup.soft_clip_overhang.emit]
+    #[test]
+    fn soft_clip_next_start_underflow_at_zero() {
+        // When next_pos - overhang underflows below 0, the engine should jump
+        // to position 0 — not stay at next_pos — so leading clip columns
+        // immediately before the alignment are emitted.
+        use crate::bam::cigar::{CigarOp, CigarOpType};
+        use seqair_types::{BamFlags, Base};
+
+        // Record at pos=2 with leading clip=3, so the leading clip base nearest
+        // the alignment is at reference position 1 (qpos 2). With overhang=5,
+        // next_start would be 2-5=-3 — underflow → should become 0.
+        let seq = [Base::C, Base::G, Base::T, Base::A, Base::A];
+        let quals = [40u8; 5];
+        let mut store = RecordStore::new();
+        store
+            .push_fields(
+                Pos0::new(2).unwrap(),
+                Pos0::new(3).unwrap(),
+                BamFlags::empty(),
+                MappingQuality::from_byte(60),
+                2,
+                0,
+                b"zero_read",
+                &[CigarOp::new(CigarOpType::SoftClip, 3), CigarOp::new(CigarOpType::Match, 2)],
+                &seq,
+                &quals,
+                &[],
+                Some(tid(0)),
+                MateFields::default(),
+                &mut (),
+            )
+            .unwrap();
+
+        // Query from 0. The engine starts at 0, but there's no active record yet.
+        // The activation loop at pos 0 sees rec.pos=2, which is > 0+5=5? No,
+        // 2 <= 5, so the record activates at position 0. The leading clip base is
+        // at qpos 2 (Base::T) at reference position 1. At position 0, the first
+        // leading clip base (qpos 0 = Base::C) also emits.
+        let mut engine = PileupEngine::new(store.prepare_for_pileup().input, region(0, 5));
+        engine.set_soft_clip_overhang(5);
+
+        let mut leading: Vec<(u32, Base)> = Vec::new();
+        while let Some(col) = engine.pileups() {
+            for aln in col.alignments() {
+                if aln.is_soft_clip() {
+                    leading.push((u32::from(col.pos()), aln.base().unwrap()));
+                }
+            }
+        }
+
+        // 3bp leading clip: qpos 0=C at ref -1 (doesn't exist), qpos 1=G at
+        // ref 0, qpos 2=T at ref 1. The formula maps aln_start - d → query
+        // clip tail: qpos = query_start + clip_len - d.
+        assert_eq!(leading, vec![(0, Base::G), (1, Base::T)]);
+    }
+
+    #[test]
+    fn alignment_view_inserted_bases() {
+        use crate::bam::cigar::{CigarOp, CigarOpType};
+        use seqair_types::{BamFlags, Base};
+
+        // 3M 2I 3M: ref span 6 (pos 0..=5), 8 query bases; "CG" inserted after
+        // ref pos 2. The insertion is reported at the anchor column (pos 2).
+        let seq = [Base::A, Base::A, Base::A, Base::C, Base::G, Base::A, Base::A, Base::A];
+        let quals = [10u8, 11, 12, 20, 21, 13, 14, 15];
+        let mut store = RecordStore::new();
+        store
+            .push_fields(
+                Pos0::new(0).unwrap(),
+                Pos0::new(5).unwrap(),
+                BamFlags::empty(),
+                MappingQuality::from_byte(30),
+                6,
+                2,
+                b"ins_read",
+                &[
+                    CigarOp::new(CigarOpType::Match, 3),
+                    CigarOp::new(CigarOpType::Insertion, 2),
+                    CigarOp::new(CigarOpType::Match, 3),
+                ],
+                &seq,
+                &quals,
+                &[],
+                Some(tid(0)),
+                MateFields::default(),
+                &mut (),
+            )
+            .unwrap();
+
+        let mut engine = PileupEngine::new(store.prepare_for_pileup().input, region(0, 5));
+
+        let mut saw_insertion = false;
+        while let Some(col) = engine.pileups() {
+            for aln in col.alignments() {
+                if matches!(aln.op, PileupOp::Insertion { .. }) {
+                    saw_insertion = true;
+                    assert_eq!(col.pos(), Pos0::new(2).unwrap());
+                    assert_eq!(aln.inserted_bases(), &[Base::C, Base::G]);
+                    let q: Vec<u8> = aln.inserted_quals().iter().filter_map(|x| x.get()).collect();
+                    assert_eq!(q, vec![20, 21]);
+                } else {
+                    // Every other op exposes no inserted run.
+                    assert!(aln.inserted_bases().is_empty());
+                    assert!(aln.inserted_quals().is_empty());
+                }
+            }
+        }
+        assert!(saw_insertion, "expected an Insertion op at the anchor column");
+    }
+
+    #[test]
+    fn pileup_alignment_indel_after() {
+        use crate::bam::cigar::{CigarOp, CigarOpType};
+        use seqair_types::{BamFlags, Base};
+
+        fn run(cigar: &[CigarOp], seq_len: u32, last_ref_pos: u32) -> Vec<(u32, Indel)> {
+            let mut store = RecordStore::new();
+            store
+                .push_fields(
+                    Pos0::new(0).unwrap(),
+                    Pos0::new(last_ref_pos).unwrap(),
+                    BamFlags::empty(),
+                    MappingQuality::from_byte(30),
+                    6,
+                    0,
+                    b"r",
+                    cigar,
+                    &vec![Base::A; seq_len as usize],
+                    &vec![40u8; seq_len as usize],
+                    &[],
+                    Some(tid(0)),
+                    MateFields::default(),
+                    &mut (),
+                )
+                .unwrap();
+            let mut engine =
+                PileupEngine::new(store.prepare_for_pileup().input, region(0, last_ref_pos));
+            let mut out = Vec::new();
+            while let Some(col) = engine.pileups() {
+                let pos = col.pos().as_u32();
+                for aln in col.alignments() {
+                    out.push((pos, aln.indel_after()));
+                }
+            }
+            out
+        }
+        let at = |v: &[(u32, Indel)], p: u32| v.iter().find(|(q, _)| *q == p).unwrap().1;
+
+        // 3M 2D 3M: deletion of 2 ref bases anchored at ref pos 2.
+        let del = run(
+            &[
+                CigarOp::new(CigarOpType::Match, 3),
+                CigarOp::new(CigarOpType::Deletion, 2),
+                CigarOp::new(CigarOpType::Match, 3),
+            ],
+            6,
+            7,
+        );
+        assert_eq!(at(&del, 2), Indel::Deletion(2), "deletion reported at its anchor");
+        assert_eq!(at(&del, 1), Indel::None, "mid-match has no indel");
+        assert_eq!(at(&del, 3), Indel::None, "deleted positions are not the anchor");
+        assert_eq!(at(&del, 5), Indel::None);
+
+        // 3M 2I 3M: insertion of 2 query bases anchored at ref pos 2.
+        let ins = run(
+            &[
+                CigarOp::new(CigarOpType::Match, 3),
+                CigarOp::new(CigarOpType::Insertion, 2),
+                CigarOp::new(CigarOpType::Match, 3),
+            ],
+            8,
+            5,
+        );
+        assert_eq!(at(&ins, 2), Indel::Insertion(2), "insertion reported at its anchor");
+        assert_eq!(at(&ins, 3), Indel::None);
+    }
+
+    // r[verify pileup.column_record_order]
+    /// `max_depth` truncation must keep the first N alignments in insertion order,
+    /// not arbitrary ones. After the stable-retain fix, the insertion order is
+    /// preserved through eviction, so truncation drops predictable (last N) entries.
+    #[test]
+    fn max_depth_truncates_in_insertion_order() {
+        use crate::bam::cigar::{CigarOp, CigarOpType};
+        use seqair_types::{BamFlags, Base};
+
+        let mut store = RecordStore::new();
+
+        // 5 records at pos=0, all spanning the full 0..50 range.
+        for i in 0..5u32 {
+            store
+                .push_fields(
+                    Pos0::new(0).unwrap(),
+                    Pos0::new(49).unwrap(),
+                    BamFlags::empty(),
+                    MappingQuality::from_byte(30),
+                    50,
+                    0,
+                    format!("read{i}").as_bytes(),
+                    &[CigarOp::new(CigarOpType::Match, 50)],
+                    &[Base::A; 50],
+                    &[40u8; 50],
+                    &[],
+                    Some(tid(0)),
+                    MateFields::default(),
+                    &mut (),
+                )
+                .unwrap();
+        }
+
+        let mut engine = PileupEngine::new(store.prepare_for_pileup().input, region(0, 49));
+        engine.set_max_depth(NonZeroU32::new(3).expect("3 is non-zero"));
+
+        // At every position, only the first 3 records (indices 0,1,2) should be kept.
+        while let Some(col) = engine.pileups() {
+            let indices: Vec<u32> = col.alignments().map(|a| a.record_idx().get()).collect();
+            assert_eq!(
+                indices,
+                vec![0, 1, 2],
+                "max_depth=3 should keep first 3 records in insertion order at pos {:?}",
+                col.pos()
+            );
+        }
+    }
+
+    mod column_entries {
+        use super::*;
+        use crate::bam::record_store::tests::window_query::{apply_moves, arb_moves, arb_store};
+        use hegel::prelude::*;
+
+        // r[verify pileup.column_contents]
+        // r[verify record_store.record_ref]
+        /// Every entry a column holds is reachable, both ways round.
+        ///
+        /// `alignments()` used to `filter_map` an entry whose record could
+        /// not be resolved, which would have made a column quietly shorter
+        /// than its own `depth()` rather than failing — a bug-hider, since
+        /// the engine mints those indices from the store it still owns.
+        /// This pins the three counts together.
+        #[hegel::test]
+        fn every_entry_is_reachable_and_counts_agree(tc: TestCase) {
+            let reads = tc.draw(arb_store());
+            let moves = tc.draw(arb_moves());
+            let mut store = RecordStore::new();
+            for (i, read) in reads.iter().enumerate() {
+                read.push(&mut store, i);
+            }
+            apply_moves(&mut store, &reads, &moves);
+
+            let mut engine = PileupEngine::new(store.prepare_for_pileup().input, region(0, 7_000));
+            let mut columns = 0usize;
+            while let Some(col) = engine.pileups() {
+                columns += 1;
+                let depth = col.depth();
+                assert_eq!(col.alignments().count(), depth, "an entry went missing");
+                assert_eq!(col.raw_alignments().count(), depth);
+
+                // Each position resolves, and resolves to its own entry.
+                for (i, view) in col.alignments().enumerate() {
+                    let at = col.alignment_at(i).expect("i < depth");
+                    assert_eq!(at.record_idx(), view.record_idx());
+                    // The record behind the entry is always there.
+                    assert_eq!(view.record().idx(), view.record_idx());
+                }
+                // One past the depth is the only `None`.
+                assert!(col.alignment_at(depth).is_none());
+            }
+            assert!(columns > 0 || reads.iter().all(|r| !r.mapped));
+        }
+    }
+
+    mod window_query {
+        use super::*;
+        use crate::bam::record_store::tests::window_query::{
+            apply_moves, arb_moves, arb_span, arb_store, brute_force,
+        };
+        use hegel::prelude::*;
+        use std::collections::BTreeSet;
+
+        // r[verify pileup.records_overlapping]
+        /// The engine's answer is the input's answer — before iteration,
+        /// from a column mid-iteration, and after the last column — and it
+        /// agrees with the columns: every alignment a column inside the
+        /// span reports is in the set, and every record in the set shows
+        /// up in some column inside the span. The two directions together
+        /// pin the query to what the engine actually emits, not to a
+        /// second copy of the overlap test. The generator includes
+        /// placed-unmapped reads, which the engine never reports, so the
+        /// second direction is what keeps them out of the query too.
+        ///
+        /// The agreement is exact only because nothing here makes a column
+        /// differ from alignment overlap: no soft-clip overhang, no depth
+        /// cap, and an engine region containing every read.
+        #[hegel::test]
+        fn engine_query_agrees_with_columns(tc: TestCase) {
+            let reads = tc.draw(arb_store());
+            let moves = tc.draw(arb_moves());
+            let span = tc.draw(arb_span());
+            let mut store = RecordStore::new();
+            for (i, read) in reads.iter().enumerate() {
+                read.push(&mut store, i);
+            }
+            apply_moves(&mut store, &reads, &moves);
+            let input = store.prepare_for_pileup().input;
+            let (start, end) = span.resolve(input.store());
+            let expected = brute_force(input.store(), start, end);
+
+            let mut engine = PileupEngine::new(input, region(0, 7_000));
+            let before: Vec<RecordIdx> = engine.records_overlapping(start, end).collect();
+            assert_eq!(&before, &expected);
+
+            let set: BTreeSet<RecordIdx> = expected.iter().copied().collect();
+            let mut seen = BTreeSet::new();
+            let mut mid: Option<Vec<RecordIdx>> = None;
+            while let Some(col) = engine.pileups() {
+                if col.pos() < start || col.pos() > end {
+                    continue;
+                }
+                for view in col.alignments() {
+                    assert!(
+                        set.contains(&view.record_idx()),
+                        "column {} reports record {} the query does not",
+                        col.pos(),
+                        view.record_idx()
+                    );
+                    seen.insert(view.record_idx());
+                }
+                if mid.is_none() {
+                    // Queried through the column, the way a caller who
+                    // has just seen something at `col.pos()` does it.
+                    let from_column: Vec<RecordIdx> = col.records_overlapping(start, end).collect();
+                    // Every index the query yields is a store index the
+                    // column can resolve: found here iff it overlaps
+                    // this very position.
+                    for &idx in &from_column {
+                        let rec = col.store().record(idx).unwrap();
+                        let covers = rec.pos <= col.pos() && rec.end_pos >= col.pos();
+                        assert_eq!(
+                            col.find_record(idx).is_some(),
+                            covers,
+                            "record {} at column {}",
+                            idx,
+                            col.pos()
+                        );
+                    }
+                    mid = Some(from_column);
+                }
+            }
+            if let Some(mid) = mid {
+                assert_eq!(mid, expected.clone());
+            }
+            // Every mapped record in the span consumes reference there
+            // (M or D), so the engine must have reported it at some column.
+            assert_eq!(seen, set);
+
+            let after: Vec<RecordIdx> = engine.records_overlapping(start, end).collect();
+            assert_eq!(&after, &expected);
+
+            engine.reclaim_allocation();
+            assert_eq!(engine.records_overlapping(start, end).count(), 0);
+        }
+    }
+}

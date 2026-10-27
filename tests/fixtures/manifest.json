@@ -1,0 +1,160 @@
+{
+  "reference": "bwa-postalt.js r985",
+  "sha256": "50660424f540ad38e08c181f628289754a39b38e2092f3010cf7478e1d0d83b7",
+  "cases": [
+    {
+      "name": "passthrough"
+    },
+    {
+      "name": "unmapped"
+    },
+    {
+      "name": "hard_clip_reported"
+    },
+    {
+      "name": "single_alt"
+    },
+    {
+      "name": "single_unplaced_alt"
+    },
+    {
+      "name": "same_locus"
+    },
+    {
+      "name": "primary_capped"
+    },
+    {
+      "name": "alt_floor"
+    },
+    {
+      "name": "group_score_difference"
+    },
+    {
+      "name": "other_group_best"
+    },
+    {
+      "name": "tied_groups"
+    },
+    {
+      "name": "reverse_alt"
+    },
+    {
+      "name": "reverse_generated"
+    },
+    {
+      "name": "reverse_reported"
+    },
+    {
+      "name": "iupac_reverse",
+      "safe_write": true
+    },
+    {
+      "name": "missing_sequence",
+      "safe_write": true
+    },
+    {
+      "name": "missing_quality",
+      "safe_write": true
+    },
+    {
+      "name": "multi_lift"
+    },
+    {
+      "name": "insertion_projection"
+    },
+    {
+      "name": "deletion_projection"
+    },
+    {
+      "name": "skip_projection"
+    },
+    {
+      "name": "clipped_start"
+    },
+    {
+      "name": "clipped_end_quirk"
+    },
+    {
+      "name": "reverse_clip"
+    },
+    {
+      "name": "hard_clip_xa"
+    },
+    {
+      "name": "nm_clamp_and_gaps"
+    },
+    {
+      "name": "equal_x_ignored"
+    },
+    {
+      "name": "no_nm"
+    },
+    {
+      "name": "empty_xa"
+    },
+    {
+      "name": "duplicate_tags"
+    },
+    {
+      "name": "nonoverlap_pa"
+    },
+    {
+      "name": "ratio_0_5",
+      "ratio": 0.5
+    },
+    {
+      "name": "ratio_capped",
+      "ratio": 2
+    },
+    {
+      "name": "ratio_negative",
+      "ratio": -1
+    },
+    {
+      "name": "overlap_adjustment"
+    },
+    {
+      "name": "opposite_strand"
+    },
+    {
+      "name": "restore_om"
+    },
+    {
+      "name": "zero_om_not_restored"
+    },
+    {
+      "name": "current_cigar_overlap_quirk"
+    },
+    {
+      "name": "read_end_boundary"
+    },
+    {
+      "name": "name_boundary"
+    },
+    {
+      "name": "hla_primary_hard_clip"
+    },
+    {
+      "name": "hla_union_first_record"
+    },
+    {
+      "name": "multiple_lifts_no_pa_reduction"
+    },
+    {
+      "name": "transitive_overlap"
+    },
+    {
+      "name": "touching_not_overlap"
+    },
+    {
+      "name": "header_only"
+    },
+    {
+      "name": "headerless",
+      "headerless": true
+    },
+    {
+      "name": "final_line_no_newline"
+    }
+  ]
+}

@@ -1,0 +1,114 @@
+{
+  "platform": "Linux-5.14.0-570.52.1.el9_6.x86_64-x86_64-with-glibc2.34",
+  "reference_sha256": "50660424f540ad38e08c181f628289754a39b38e2092f3010cf7478e1d0d83b7",
+  "input_sam_bytes": 909053220,
+  "runs": {
+    "k8_sam": [
+      {
+        "wall_seconds": 61.81,
+        "user_seconds": 60.93,
+        "system_seconds": 1.22,
+        "max_rss_kib": 112760
+      },
+      {
+        "wall_seconds": 62.3,
+        "user_seconds": 61.33,
+        "system_seconds": 1.29,
+        "max_rss_kib": 111740
+      },
+      {
+        "wall_seconds": 62.13,
+        "user_seconds": 61.31,
+        "system_seconds": 1.11,
+        "max_rss_kib": 110804
+      }
+    ],
+    "rust_sam_compat": [
+      {
+        "wall_seconds": 4.85,
+        "user_seconds": 4.74,
+        "system_seconds": 0.09,
+        "max_rss_kib": 5632
+      },
+      {
+        "wall_seconds": 4.84,
+        "user_seconds": 4.73,
+        "system_seconds": 0.1,
+        "max_rss_kib": 5632
+      },
+      {
+        "wall_seconds": 4.85,
+        "user_seconds": 4.74,
+        "system_seconds": 0.09,
+        "max_rss_kib": 5632
+      }
+    ],
+    "rust_sam_default": [
+      {
+        "wall_seconds": 4.91,
+        "user_seconds": 4.79,
+        "system_seconds": 0.1,
+        "max_rss_kib": 5632
+      },
+      {
+        "wall_seconds": 4.9,
+        "user_seconds": 4.78,
+        "system_seconds": 0.11,
+        "max_rss_kib": 5632
+      },
+      {
+        "wall_seconds": 4.89,
+        "user_seconds": 4.78,
+        "system_seconds": 0.09,
+        "max_rss_kib": 5632
+      }
+    ],
+    "rust_bam_2_workers": [
+      {
+        "wall_seconds": 9.76,
+        "user_seconds": 16.33,
+        "system_seconds": 0.22,
+        "max_rss_kib": 8704
+      },
+      {
+        "wall_seconds": 9.79,
+        "user_seconds": 16.36,
+        "system_seconds": 0.22,
+        "max_rss_kib": 8704
+      },
+      {
+        "wall_seconds": 9.83,
+        "user_seconds": 16.42,
+        "system_seconds": 0.2,
+        "max_rss_kib": 8704
+      }
+    ]
+  },
+  "median": {
+    "k8_sam": {
+      "wall_seconds": 62.13,
+      "user_seconds": 61.31,
+      "system_seconds": 1.22,
+      "max_rss_kib": 111740
+    },
+    "rust_sam_compat": {
+      "wall_seconds": 4.85,
+      "user_seconds": 4.74,
+      "system_seconds": 0.09,
+      "max_rss_kib": 5632
+    },
+    "rust_sam_default": {
+      "wall_seconds": 4.9,
+      "user_seconds": 4.78,
+      "system_seconds": 0.1,
+      "max_rss_kib": 5632
+    },
+    "rust_bam_2_workers": {
+      "wall_seconds": 9.79,
+      "user_seconds": 16.36,
+      "system_seconds": 0.22,
+      "max_rss_kib": 8704
+    }
+  },
+  "sam_speedup": 12.810309278350516
+}

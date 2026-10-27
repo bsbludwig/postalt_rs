@@ -1,0 +1,17 @@
+{
+  "compat": {
+    "sha256": "258f2eba1cea353146a0dc12b31f2a624c6a8b96f19b40921e29f0b15fd4baf8",
+    "bytes": 2162417431,
+    "lines": 3632334
+  },
+  "default": {
+    "sha256": "c6957efe2d4f4c4e3eadbb56b665b8959b878c90dc4172b8514050b8dda22237",
+    "bytes": 2162417431,
+    "lines": 3632334
+  },
+  "bam_normalized": {
+    "sha256": "4cf1bc34db340765d657c90766d0e3b2d4ce96ab2f46667166a9832c48c148ef",
+    "bytes": 2162355534,
+    "lines": 3632334
+  }
+}

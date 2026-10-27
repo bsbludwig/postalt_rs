@@ -1,0 +1,1645 @@
+//! Parse and query CIGAR strings. [`CigarMapping`] maps reference positions to query positions
+//! (linear fast-path for clip+match CIGARs, `SmallVec` fallback for complex ones);
+//! [`CigarPosInfo`] describes what occupies a given reference position.
+
+use crate::utils::{TraceErr, TraceOk};
+use seqair_types::{Pos0, QPos, SmallVec};
+
+// r[impl cigar.operations]
+// r[impl io.named_constants]
+pub const CIGAR_M: u8 = 0;
+pub const CIGAR_I: u8 = 1;
+pub const CIGAR_D: u8 = 2;
+pub const CIGAR_N: u8 = 3;
+pub const CIGAR_S: u8 = 4;
+pub const CIGAR_H: u8 = 5;
+pub const CIGAR_P: u8 = 6;
+pub const CIGAR_EQ: u8 = 7;
+pub const CIGAR_X: u8 = 8;
+
+// r[impl io.typed_cigar_ops]
+// r[impl cigar.index]
+/// Strongly-typed CIGAR operation kind. `Unknown` carries the raw 4-bit
+/// op code from BAM for codes that aren't in the SAM spec — we tolerate
+/// them on read so a single bad op doesn't fail the whole record, and
+/// round-trip them verbatim on write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CigarOpType {
+    /// M(0): alignment match (may be sequence match or mismatch)
+    Match,
+    /// I(1): insertion to the reference
+    Insertion,
+    /// D(2): deletion from the reference
+    Deletion,
+    /// N(3): skipped region from the reference (e.g. intron)
+    RefSkip,
+    /// S(4): soft clipping
+    SoftClip,
+    /// H(5): hard clipping
+    HardClip,
+    /// P(6): padding
+    Padding,
+    /// =(7): sequence match
+    SeqMatch,
+    /// X(8): sequence mismatch
+    SeqMismatch,
+    /// 9..=15: reserved/unspecified code from BAM; the inner byte is the raw 4-bit op
+    Unknown(u8),
+}
+
+impl CigarOpType {
+    /// Decode a 4-bit BAM op code. Codes outside the spec become [`Self::Unknown`].
+    pub const fn from_bam(code: u8) -> Self {
+        match code {
+            CIGAR_M => Self::Match,
+            CIGAR_I => Self::Insertion,
+            CIGAR_D => Self::Deletion,
+            CIGAR_N => Self::RefSkip,
+            CIGAR_S => Self::SoftClip,
+            CIGAR_H => Self::HardClip,
+            CIGAR_P => Self::Padding,
+            CIGAR_EQ => Self::SeqMatch,
+            CIGAR_X => Self::SeqMismatch,
+            other => Self::Unknown(other),
+        }
+    }
+
+    // r[impl bam.owned_record.cigar_op]
+    /// Convert back to the BAM numeric code. Inverse of [`from_bam`](Self::from_bam).
+    pub const fn to_bam_code(self) -> u8 {
+        match self {
+            Self::Match => CIGAR_M,
+            Self::Insertion => CIGAR_I,
+            Self::Deletion => CIGAR_D,
+            Self::RefSkip => CIGAR_N,
+            Self::SoftClip => CIGAR_S,
+            Self::HardClip => CIGAR_H,
+            Self::Padding => CIGAR_P,
+            Self::SeqMatch => CIGAR_EQ,
+            Self::SeqMismatch => CIGAR_X,
+            Self::Unknown(code) => code,
+        }
+    }
+
+    pub const fn consumes_ref(self) -> bool {
+        matches!(
+            self,
+            Self::Match | Self::Deletion | Self::RefSkip | Self::SeqMatch | Self::SeqMismatch
+        )
+    }
+
+    pub const fn consumes_query(self) -> bool {
+        matches!(
+            self,
+            Self::Match | Self::Insertion | Self::SoftClip | Self::SeqMatch | Self::SeqMismatch
+        )
+    }
+}
+
+// r[impl bam.owned_record.cigar_op]
+/// A single CIGAR operation, stored in the same packed u32 layout BAM uses
+/// on disk: `len << 4 | op_code`. Decoding the op type is a single shift+mask;
+/// re-encoding for BAM output is a no-op.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct CigarOp(u32);
+
+const _: () = assert!(size_of::<CigarOp>() == 4, "CigarOp must stay 4 bytes");
+
+impl CigarOp {
+    /// BAM packs length into the upper 28 bits, so max length is 2^28-1 = `268_435_455`.
+    pub const fn new(op: CigarOpType, len: u32) -> Self {
+        debug_assert!(len < (1 << 28), "CIGAR op length exceeds 28-bit BAM limit");
+        Self((len << 4) | op.to_bam_code() as u32)
+    }
+
+    /// Wrap a raw BAM-packed u32 (`len << 4 | op_code`). Always succeeds —
+    /// unknown 4-bit codes surface as [`CigarOpType::Unknown`] when decoded.
+    pub const fn from_bam_u32(packed: u32) -> Self {
+        Self(packed)
+    }
+
+    /// Encode to BAM packed u32 format (`len << 4 | op_code`).
+    pub const fn to_bam_u32(self) -> u32 {
+        self.0
+    }
+
+    /// Length of the operation (upper 28 bits).
+    #[allow(clippy::len_without_is_empty, reason = "len is the CIGAR op span, not a collection")]
+    pub const fn len(self) -> u32 {
+        self.0 >> 4
+    }
+
+    /// Raw BAM op code (lower 4 bits).
+    pub const fn op_code(self) -> u8 {
+        (self.0 & 0xF) as u8
+    }
+
+    /// Decoded op type. Reserved op codes (9..=15) decode to [`CigarOpType::Unknown`].
+    pub const fn op_type(self) -> CigarOpType {
+        CigarOpType::from_bam(self.op_code())
+    }
+
+    pub const fn consumes_ref(self) -> bool {
+        consumes_ref(self.op_code())
+    }
+
+    pub const fn consumes_query(self) -> bool {
+        consumes_query(self.op_code())
+    }
+
+    /// Reinterpret a slice of ops as their on-the-wire BAM bytes
+    /// (LE u32 per op). Safe via `CigarOp: Pod` — `repr(transparent)` over
+    /// `u32` with every bit pattern a valid op.
+    ///
+    /// On big-endian hosts the bytes are still in native order, NOT BAM-on-disk
+    /// order. Callers that write to disk on a BE host would need to byte-swap
+    /// each op first; we don't, because seqair targets LE only.
+    #[inline]
+    pub fn ops_as_bytes(ops: &[Self]) -> &[u8] {
+        bytemuck::cast_slice(ops)
+    }
+
+    /// Append BAM-on-disk CIGAR bytes (LE u32 per op) into a typed `Vec<CigarOp>`.
+    ///
+    /// Source bytes are unaligned; on LE hosts this is a single memcpy, on BE
+    /// it would byte-swap per op (we don't compile that path — seqair is LE only).
+    /// Caller must ensure `bytes.len()` is a multiple of 4 (true for valid BAM).
+    #[inline]
+    pub fn extend_from_bam_bytes(dst: &mut Vec<Self>, bytes: &[u8]) {
+        debug_assert!(bytes.len().is_multiple_of(4), "BAM CIGAR bytes must be multiple of 4");
+        #[cfg(target_endian = "little")]
+        {
+            let n_ops = bytes.len() / 4;
+            let n_bytes = n_ops.checked_mul(4).expect("cigar byte length overflow");
+            let new_len = dst.len().checked_add(n_ops).expect("cigar slab len overflow");
+            dst.reserve(n_ops);
+            // SAFETY: CigarOp is repr(transparent) over u32 (4 bytes) with a
+            // compile-time size guard on line 107. Every bit pattern is a valid
+            // CigarOp (op codes 0..=15 all decodable, length field is unconstrained
+            // u28). On LE the in-memory u32 byte order matches BAM's LE on-disk
+            // order, so a bytewise memcpy of n_ops * 4 source bytes produces n_ops
+            // valid CigarOp values. dst has at least n_ops uninit slots after
+            // reserve(); we copy n_bytes into it, then bump len.
+            unsafe {
+                let dst_ptr = dst.as_mut_ptr().add(dst.len()).cast::<u8>();
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst_ptr, n_bytes);
+                dst.set_len(new_len);
+            }
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            for chunk in bytes.chunks_exact(4) {
+                let arr: [u8; 4] = chunk.try_into().expect("chunks_exact(4) yields 4 bytes");
+                dst.push(CigarOp::from_bam_u32(u32::from_le_bytes(arr)));
+            }
+        }
+    }
+
+    /// View raw BAM CIGAR bytes as `&[CigarOp]` without copying.
+    ///
+    /// Returns `None` if the length is not a multiple of 4, the pointer is
+    /// not 4-byte aligned, or the target is big-endian. On aligned LE input
+    /// this is a zero-cost transmute. BAM CIGAR data is **not** guaranteed
+    /// aligned — the read name length determines the start offset, and
+    /// samtools produces unaligned CIGAR data when `l_read_name` is not a
+    /// multiple of 4. Use [`extend_from_bam_bytes`](Self::extend_from_bam_bytes) if alignment cannot be
+    /// guaranteed (it's always correct, just requires a copy).
+    // r[impl cigar.slice_from_bam_bytes]
+    #[inline]
+    pub fn slice_from_bam_bytes(bytes: &[u8]) -> Option<&[Self]> {
+        if bytes.is_empty() {
+            return Some(&[]);
+        }
+        if !bytes.len().is_multiple_of(4) {
+            return None;
+        }
+        #[cfg(target_endian = "little")]
+        {
+            // BAM data is packed sequentially: 32-byte fixed header, then
+            // qname (l_read_name bytes, including NUL), then CIGAR. If
+            // l_read_name is not a multiple of 4, the CIGAR pointer is
+            // unaligned. from_raw_parts requires CigarOp alignment (4).
+            #[allow(
+                clippy::arithmetic_side_effects,
+                clippy::manual_is_multiple_of,
+                reason = "pointer-to-usize cast is defined on all supported targets; align_of is non-zero so % is safe"
+            )]
+            if bytes.as_ptr() as usize % align_of::<CigarOp>() != 0 {
+                return None;
+            }
+            let n = bytes.len() / 4;
+            // SAFETY:
+            // - Length: `n` is `bytes.len() / 4`, checked to be a multiple of
+            //   4 above. The pointer advance of `n * size_of::<CigarOp>()`
+            //   (== n * 4) stays within the allocation.
+            // - Alignment: checked via `is_aligned()` above.
+            // - Validity: every `u32` bit pattern is a valid `CigarOp` — the
+            //   op code field is 4 bits (0..=15, all decodable) and the length
+            //   field is an unconstrained 28-bit integer.
+            // - Endianness: guarded by `#[cfg(target_endian = "little")]`;
+            //   on LE hosts BAM's on-disk LE `u32` byte order matches native
+            //   in-memory layout.
+            Some(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const CigarOp, n) })
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            None
+        }
+    }
+}
+
+impl std::fmt::Debug for CigarOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CigarOp").field("op", &self.op_type()).field("len", &self.len()).finish()
+    }
+}
+
+impl std::fmt::Display for CigarOpType {
+    /// SAM 1.6 single-character op code. `Unknown` renders as `?`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write as _;
+        let c = match self {
+            Self::Match => 'M',
+            Self::Insertion => 'I',
+            Self::Deletion => 'D',
+            Self::RefSkip => 'N',
+            Self::SoftClip => 'S',
+            Self::HardClip => 'H',
+            Self::Padding => 'P',
+            Self::SeqMatch => '=',
+            Self::SeqMismatch => 'X',
+            Self::Unknown(_) => '?',
+        };
+        f.write_char(c)
+    }
+}
+
+impl std::fmt::Display for CigarOp {
+    /// `{len}{op_char}`, e.g. `10M`, `2I`, `4=`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}{}", self.len(), self.op_type())
+    }
+}
+
+/// Display wrapper for a slice of [`CigarOp`]s, formatting as a SAM CIGAR
+/// string (e.g. `"10M2I3D"`). Allocation-free — `format!("{}", CigarStr(ops))`
+/// when you need an owned `String`.
+pub struct CigarStr<'a>(pub &'a [CigarOp]);
+
+impl std::fmt::Display for CigarStr<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for op in self.0 {
+            write!(f, "{op}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Whether a CIGAR op code consumes the reference.
+const fn consumes_ref(op: u8) -> bool {
+    matches!(op, CIGAR_M | CIGAR_D | CIGAR_N | CIGAR_EQ | CIGAR_X)
+}
+
+/// Whether a CIGAR op code consumes the query.
+const fn consumes_query(op: u8) -> bool {
+    matches!(op, CIGAR_M | CIGAR_I | CIGAR_S | CIGAR_EQ | CIGAR_X)
+}
+
+/// Sum of query-consuming op lengths (M, I, S, =, X).
+pub fn calc_query_len(ops: &[CigarOp]) -> u32 {
+    let mut qlen = 0u32;
+    for op in ops {
+        if op.consumes_query() {
+            qlen = qlen.saturating_add(op.len());
+        }
+    }
+    qlen
+}
+
+// r[impl cigar.matches_indels]
+/// Sum of M op lengths and I/D op lengths.
+pub fn calc_matches_indels(ops: &[CigarOp]) -> (u32, u32) {
+    let mut matches = 0u32;
+    let mut indels = 0u32;
+    for op in ops {
+        match op.op_code() {
+            CIGAR_M => matches = matches.saturating_add(op.len()),
+            CIGAR_I | CIGAR_D => indels = indels.saturating_add(op.len()),
+            _ => {}
+        }
+    }
+    (matches, indels)
+}
+
+// r[impl cigar.soft_clips]
+/// Soft-clipped bases at the start and at the end of `ops`, hard clips looked
+/// past.
+pub fn soft_clips(ops: &[CigarOp]) -> (u32, u32) {
+    fn at_end<'a>(ops: impl Iterator<Item = &'a CigarOp>) -> u32 {
+        ops.map_while(|op| match op.op_code() {
+            CIGAR_S => Some(op.len()),
+            CIGAR_H => Some(0),
+            _ => None,
+        })
+        .fold(0, u32::saturating_add)
+    }
+    (at_end(ops.iter()), at_end(ops.iter().rev()))
+}
+
+// r[impl bam.record.end_pos]
+// r[impl bam.record.zero_refspan]
+/// 0-based exclusive end position from `pos` + reference-consuming op lengths.
+// r[impl interval.end_pos_inclusive]
+pub fn compute_end_pos(pos: Pos0, ops: &[CigarOp]) -> Option<Pos0> {
+    let mut ref_len: i64 = 0;
+    for op in ops {
+        if op.consumes_ref() {
+            ref_len = ref_len.checked_add(i64::from(op.len()))?;
+        }
+    }
+    if ref_len == 0 {
+        Some(pos)
+    } else {
+        pos.checked_add_offset(seqair_types::Offset::new(ref_len.checked_sub(1)?))
+    }
+}
+
+/// Position information returned by `CigarMapping` for the pileup engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CigarPosInfo {
+    /// M/=/X op: read has a base aligned here.
+    Match { qpos: QPos },
+    /// M/=/X op at the last position before an I op follows.
+    Insertion { qpos: QPos, insert_len: u32 },
+    /// D op: deletion spanning this position. `del_len` is the total length of the D CIGAR op.
+    Deletion { del_len: u32 },
+    /// D or N op at its last position, followed by an I op (e.g. `D I M`).
+    /// `del_len` is the total D/N op length; `insert_len` is the total following insertion length.
+    // r[impl pileup_indel.complex_indel]
+    ComplexIndel { del_len: u32, insert_len: u32, is_refskip: bool },
+    /// N op: reference skip spanning this position.
+    RefSkip,
+}
+
+/// Compact CIGAR mapping for fast qpos lookup in the pileup engine.
+///
+/// Two variants:
+///
+/// **`Linear`**: For the ~96% of reads whose CIGAR is a single contiguous
+/// match block with optional leading/trailing clips (`[HS]* [M=X]+ [HS]*`).
+/// Computes `qpos` with a single subtraction. 16 bytes.
+///
+/// **`Complex`**: For reads with insertions, deletions, reference skips,
+/// or multiple disjoint match blocks (~4% of reads). Stores a pre-computed
+/// index of [`CompactOp`]s — 12 bytes each, 6 inline (72-byte buffer, no
+/// heap allocation for 98.1% of complex CIGARs).
+///
+/// Real-world data from NA12878 chr12 Illumina WGS (100k reads):
+/// 96.1% Linear, 3.9% Complex. Of complex reads: 79% have 3 ops (e.g. `M I M`),
+/// 98.1% fit in ≤6 ops (inline).
+pub enum CigarMapping {
+    /// `qpos = (pos - rec_pos) + query_offset`. No insertion/deletion support —
+    /// `try_linear` rejects CIGARs containing I, D, or N ops.
+    Linear { rec_pos: Pos0, query_offset: u32, match_len: u32 },
+    /// Pre-computed compact ops for position lookup via linear scan (≤4 ops)
+    /// or binary search (>4 ops). The mapping is immutable — `pos_info_at`
+    /// is a pure function of `pos`, allowing the active set to be reordered
+    /// without invalidating state.
+    Complex(SmallVec<CompactOp, 6>),
+}
+
+impl std::fmt::Debug for CigarMapping {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Linear { rec_pos, query_offset, match_len } => f
+                .debug_struct("Linear")
+                .field("rec_pos", &rec_pos)
+                .field("query_offset", query_offset)
+                .field("match_len", match_len)
+                .finish(),
+            Self::Complex(ops) => write!(f, "Complex({} ops)", ops.len()),
+        }
+    }
+}
+
+/// Compact CIGAR operation for the position-lookup index used by the pileup engine.
+///
+/// 12 bytes (down from 16). Each op records the absolute reference start, absolute
+/// query start, operation length, and CIGAR op code. The length and op code are
+/// packed into a single `u32` (`len << 4 | op_code`), matching BAM's on-disk
+/// packing — extraction is a single shift or mask.
+///
+/// Stored inline in [`CigarMapping::Complex`] via `SmallVec<CompactOp, 6>`
+/// (72-byte inline buffer, no heap allocation for 98.1% of complex CIGARs).
+#[derive(Clone, Copy)]
+pub struct CompactOp {
+    /// 0-based reference position where this operation begins.
+    /// Range: `0..=i32::MAX` (BAM's position limit).
+    ref_start: u32,
+    /// 0-based query position where this operation begins. Equal to the
+    /// cumulative leading clip length plus all preceding query-consuming
+    /// op lengths.
+    query_start: u32,
+    /// Packed: `len << 4 | op_code`. Same layout as BAM's on-disk CIGAR
+    /// encoding. Upper 28 bits = operation length, lower 4 bits = CIGAR
+    /// op code (0=M, 1=I, 2=D, 3=N, 4=S, 5=H, 6=P, 7==, 8=X).
+    len_op: u32,
+}
+
+impl CompactOp {
+    /// CIGAR operation length (upper 28 bits of the BAM-packed `u32`).
+    #[inline]
+    #[allow(
+        clippy::len_without_is_empty,
+        reason = "CIGAR ops don't have a meaningful 'empty' state"
+    )]
+    pub fn len(self) -> u32 {
+        self.len_op >> 4
+    }
+    /// BAM CIGAR op code (lower 4 bits). See module-level constants
+    /// `CIGAR_M` through `CIGAR_X`.
+    #[inline]
+    pub fn op_type(self) -> u8 {
+        (self.len_op & 0xF) as u8
+    }
+}
+
+impl CigarMapping {
+    #[inline]
+    pub fn new(rec_pos: Pos0, ops: &[CigarOp]) -> Option<Self> {
+        match try_linear(ops) {
+            Some((query_offset, match_len)) => {
+                Some(Self::Linear { rec_pos, query_offset, match_len })
+            }
+            None => Some(Self::Complex(build_compact_ops(rec_pos, ops)?)),
+        }
+    }
+
+    // r[impl cigar.qpos_at]
+    #[inline]
+    pub fn pos_info_at(&self, pos: Pos0) -> Option<CigarPosInfo> {
+        match self {
+            Self::Linear { rec_pos, query_offset, match_len } => {
+                let offset = pos.as_i64().wrapping_sub(rec_pos.as_i64());
+                if offset < 0 || offset >= i64::from(*match_len) {
+                    return None;
+                }
+                Some(CigarPosInfo::Match {
+                    qpos: QPos::new(
+                        u32::try_from(offset)
+                            .trace_ok("offset exceeds u32 range")?
+                            .checked_add(*query_offset)
+                            .trace_err("qpos overflow")?,
+                    ),
+                })
+                // Linear path never has insertions/deletions (try_linear rejects them)
+            }
+            Self::Complex(ops) => {
+                if ops.len() <= 4 {
+                    pos_info_linear(ops, pos)
+                } else {
+                    pos_info_bsearch(ops, pos)
+                }
+            }
+        }
+    }
+
+    /// Query position of a soft-clipped base projected onto reference position
+    /// `pos`, when `pos` lies within `max_overhang` reference bases of the
+    /// alignment on the side that carries a soft clip.
+    ///
+    /// Soft-clipped bases are not aligned, so this assumes a gapless diagonal
+    /// extension of the read past its alignment boundary — the natural
+    /// interpretation for recovering a single clipped base adjacent to the
+    /// alignment (e.g. a TAPS methylation base the aligner trimmed). `query_len`
+    /// is the read's SEQ length (soft clips counted, hard clips excluded), used
+    /// to size the trailing clip.
+    // r[impl cigar.soft_clip_qpos]
+    pub fn soft_clip_qpos_at(&self, pos: Pos0, max_overhang: u32, query_len: u32) -> Option<QPos> {
+        if max_overhang == 0 {
+            return None;
+        }
+        let pos = pos.as_i64();
+        match self {
+            Self::Linear { rec_pos, query_offset, match_len } => {
+                let aln_start = rec_pos.as_i64();
+                // Leading clip: columns [aln_start - k, aln_start).
+                let lead_k = max_overhang.min(*query_offset);
+                let lead_d = aln_start.checked_sub(pos)?;
+                if lead_d >= 1 && lead_d <= i64::from(lead_k) {
+                    return u32::try_from(i64::from(*query_offset).checked_sub(lead_d)?)
+                        .ok()
+                        .map(QPos::new);
+                }
+                // Trailing clip: columns [aln_end, aln_end + k).
+                let aln_end = aln_start.checked_add(i64::from(*match_len))?;
+                let trail_len = query_len.saturating_sub(query_offset.saturating_add(*match_len));
+                let trail_k = max_overhang.min(trail_len);
+                let trail_d = pos.checked_sub(aln_end)?;
+                if trail_d >= 0 && trail_d < i64::from(trail_k) {
+                    return u32::try_from(
+                        i64::from(*query_offset)
+                            .checked_add(i64::from(*match_len))?
+                            .checked_add(trail_d)?,
+                    )
+                    .ok()
+                    .map(QPos::new);
+                }
+                None
+            }
+            Self::Complex(ops) => {
+                let (lead, trail) = clip_flanks(ops);
+                if let Some(clip) = lead {
+                    let aln_start = i64::from(clip.ref_start);
+                    let k = max_overhang.min(clip.len());
+                    let d = aln_start.checked_sub(pos)?;
+                    if d >= 1 && d <= i64::from(k) {
+                        return u32::try_from(
+                            i64::from(clip.query_start)
+                                .checked_add(i64::from(clip.len()))?
+                                .checked_sub(d)?,
+                        )
+                        .ok()
+                        .map(QPos::new);
+                    }
+                }
+                if let Some(clip) = trail {
+                    let aln_end = i64::from(clip.ref_start);
+                    let k = max_overhang.min(clip.len());
+                    let d = pos.checked_sub(aln_end)?;
+                    if d >= 0 && d < i64::from(k) {
+                        return u32::try_from(i64::from(clip.query_start).checked_add(d)?)
+                            .ok()
+                            .map(QPos::new);
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Length of a deletion that immediately follows reference position `pos`
+    /// for this read — i.e. when `pos` is the last matched reference base
+    /// before a `D` op (the deletion's *anchor*). `None` everywhere else.
+    ///
+    /// This is the deletion counterpart of the `Insertion` that
+    /// [`pos_info_at`](Self::pos_info_at) already reports at an anchor, and
+    /// mirrors htslib's `bam_pileup` reporting a negative `indel` on the base
+    /// before a deletion. Insertions are *not* reported here — read those from
+    /// [`CigarPosInfo::Insertion`].
+    #[inline]
+    pub fn deletion_after_at(&self, pos: Pos0) -> Option<u32> {
+        match self {
+            // Linear CIGARs are clips-match-clips with no indels.
+            Self::Linear { .. } => None,
+            Self::Complex(ops) => {
+                let pos: u32 = pos.as_u32();
+                for (i, op) in ops.iter().enumerate() {
+                    if !consumes_ref(op.op_type()) {
+                        continue;
+                    }
+                    let ref_end = op.ref_start.saturating_add(op.len());
+                    if pos < op.ref_start || pos >= ref_end {
+                        continue;
+                    }
+                    // A deletion can only follow a match block, and only from
+                    // its last reference position.
+                    if matches!(op.op_type(), CIGAR_M | CIGAR_EQ | CIGAR_X)
+                        && pos == ref_end.wrapping_sub(1)
+                    {
+                        return next_deletion_len(ops, i);
+                    }
+                    return None;
+                }
+                None
+            }
+        }
+    }
+}
+
+// r[impl cigar.qpos_bounds]
+/// Check if the CIGAR is a simple clips-match-clips pattern.
+/// Returns `(query_offset, match_len)` where `query_offset` is the leading soft-clip length
+/// and `match_len` is the total length of the contiguous match/seq-match/seq-mismatch block.
+/// Returns `None` for CIGARs with insertions, deletions, or multiple disjoint match regions.
+#[inline]
+fn try_linear(ops: &[CigarOp]) -> Option<(u32, u32)> {
+    let mut query_offset = 0u32;
+    let mut match_len = 0u32;
+    // 0 = leading clips, 1 = match block, 2 = trailing clips
+    let mut phase = 0u8;
+
+    for op in ops {
+        let len = op.len();
+        match (phase, op.op_code()) {
+            (0, CIGAR_S) => query_offset = query_offset.saturating_add(len),
+            (0, CIGAR_H) => {}
+            (0, CIGAR_M | CIGAR_EQ | CIGAR_X) => {
+                match_len = match_len.saturating_add(len);
+                phase = 1;
+            }
+            (1, CIGAR_M | CIGAR_EQ | CIGAR_X) => match_len = match_len.saturating_add(len),
+            (1 | 2, CIGAR_S | CIGAR_H) => phase = 2,
+            _ => return None,
+        }
+    }
+
+    // Only succeed if we reached the match phase (phase >= 1).
+    // Pure soft/hard clips (phase == 0) should use the complex path.
+    if phase >= 1 { Some((query_offset, match_len)) } else { None }
+}
+
+/// The leading and trailing soft-clip ops of a compact CIGAR, if present.
+/// "Leading" is the soft clip before the first reference-consuming op (its
+/// `ref_start` is the alignment start); "trailing" is the soft clip after the
+/// last reference-consuming op (its `ref_start` is one past the last aligned
+/// reference base). Hard clips, which neither consume reference nor query, are
+/// skipped.
+///
+/// Pure-soft-clip CIGARs (no reference-consuming ops) return the same op for
+/// lead and trail. This is unreachable in the pileup path — such reads are
+/// excluded from the active set by r[`pileup.soft_clip_at_position`] — but the
+/// caller should not assume lead ≠ trail.
+fn clip_flanks(ops: &[CompactOp]) -> (Option<CompactOp>, Option<CompactOp>) {
+    let mut lead = None;
+    for op in ops {
+        match op.op_type() {
+            CIGAR_S => {
+                lead = Some(*op);
+                break;
+            }
+            CIGAR_H => continue,
+            _ => break,
+        }
+    }
+    let mut trail = None;
+    for op in ops.iter().rev() {
+        match op.op_type() {
+            CIGAR_S => {
+                trail = Some(*op);
+                break;
+            }
+            CIGAR_H => continue,
+            _ => break,
+        }
+    }
+    (lead, trail)
+}
+
+fn build_compact_ops(rec_pos: Pos0, ops: &[CigarOp]) -> Option<SmallVec<CompactOp, 6>> {
+    let mut out = SmallVec::with_capacity(ops.len());
+    let mut ref_off: i64 = 0;
+    let mut query_off: u32 = 0;
+
+    for op in ops {
+        let len = op.len();
+        let op_type = op.op_code();
+
+        let ref_start_i64 = rec_pos.as_i64().wrapping_add(ref_off);
+        // r[impl cigar.compact_op_position_invariant]
+        let ref_start = u32::try_from(ref_start_i64).trace_ok("ref_start exceeds u32 range")?;
+        let len_op = op.to_bam_u32();
+        out.push(CompactOp { ref_start, query_start: query_off, len_op });
+
+        if consumes_ref(op_type) {
+            ref_off = ref_off.checked_add(i64::from(len)).trace_err("ref offset overflow")?;
+        }
+        if consumes_query(op_type) {
+            query_off = query_off.saturating_add(len);
+        }
+    }
+
+    Some(out)
+}
+
+// r[impl pileup_indel.insertion_len]
+// r[impl pileup_indel.complex_indel]
+/// Sum insertion lengths for consecutive I ops after index `op_idx`,
+/// skipping P (padding) ops. htslib skips P when peeking ahead for
+/// insertions (handles `M P I`, `D P I`, etc.).
+#[inline]
+fn next_insertion_len(ops: &[CompactOp], op_idx: usize) -> Option<u32> {
+    let mut total = 0u32;
+    let mut idx = op_idx.checked_add(1)?;
+    while let Some(next) = ops.get(idx) {
+        if next.op_type() == CIGAR_P {
+            idx = idx.checked_add(1)?;
+            continue;
+        }
+        if next.op_type() != CIGAR_I {
+            break;
+        }
+        total = total.saturating_add(next.len());
+        idx = idx.checked_add(1)?;
+    }
+    if total > 0 { Some(total) } else { None }
+}
+
+/// Length of the `D` op immediately following index `op_idx` (skipping `P`
+/// padding ops, as htslib does), or `None` if the next op is not a deletion.
+#[inline]
+fn next_deletion_len(ops: &[CompactOp], op_idx: usize) -> Option<u32> {
+    let mut idx = op_idx.checked_add(1)?;
+    while let Some(next) = ops.get(idx) {
+        match next.op_type() {
+            CIGAR_P => idx = idx.checked_add(1)?,
+            CIGAR_D => return Some(next.len()),
+            _ => return None,
+        }
+    }
+    None
+}
+
+// r[impl pileup_indel.insertion_at_last_match]
+// r[impl pileup_indel.complex_indel]
+#[inline]
+fn classify_op(
+    ops: &[CompactOp],
+    i: usize,
+    op: &CompactOp,
+    pos: u32,
+    ref_end: u32,
+) -> Option<CigarPosInfo> {
+    if consumes_query(op.op_type()) {
+        debug_assert!(
+            matches!(op.op_type(), CIGAR_M | CIGAR_EQ | CIGAR_X),
+            "classify_op reached query-consuming branch with unexpected op type {}",
+            op.op_type()
+        );
+        let offset = pos.wrapping_sub(op.ref_start);
+        let qpos = QPos::new(op.query_start.checked_add(offset).trace_err("qpos overflow")?);
+        if pos == ref_end.wrapping_sub(1)
+            && let Some(insert_len) = next_insertion_len(ops, i)
+        {
+            return Some(CigarPosInfo::Insertion { qpos, insert_len });
+        }
+        Some(CigarPosInfo::Match { qpos })
+    } else if op.op_type() == CIGAR_D {
+        if pos == ref_end.wrapping_sub(1)
+            && let Some(insert_len) = next_insertion_len(ops, i)
+        {
+            return Some(CigarPosInfo::ComplexIndel {
+                del_len: op.len(),
+                insert_len,
+                is_refskip: false,
+            });
+        }
+        Some(CigarPosInfo::Deletion { del_len: op.len() })
+    } else if op.op_type() == CIGAR_N {
+        if pos == ref_end.wrapping_sub(1)
+            && let Some(insert_len) = next_insertion_len(ops, i)
+        {
+            return Some(CigarPosInfo::ComplexIndel {
+                del_len: op.len(),
+                insert_len,
+                is_refskip: true,
+            });
+        }
+        Some(CigarPosInfo::RefSkip)
+    } else {
+        None
+    }
+}
+
+#[inline]
+fn pos_info_linear(ops: &[CompactOp], pos: Pos0) -> Option<CigarPosInfo> {
+    let pos: u32 = pos.as_u32();
+    for (i, op) in ops.iter().enumerate() {
+        if !consumes_ref(op.op_type()) {
+            continue;
+        }
+        let ref_end = op.ref_start.saturating_add(op.len());
+        if pos < op.ref_start || pos >= ref_end {
+            continue;
+        }
+        return classify_op(ops, i, op, pos, ref_end);
+    }
+    None
+}
+
+// r[impl perf.cigar_binary_search]
+#[inline]
+fn pos_info_bsearch(ops: &[CompactOp], pos: Pos0) -> Option<CigarPosInfo> {
+    let pos: u32 = pos.as_u32();
+    let idx = ops.partition_point(|op| op.ref_start <= pos);
+    if idx == 0 {
+        return None;
+    }
+    for i in idx.saturating_sub(2)..ops.len().min(idx.saturating_add(1)) {
+        let Some(op) = ops.get(i) else { continue };
+        if !consumes_ref(op.op_type()) {
+            continue;
+        }
+        let ref_end = op.ref_start.saturating_add(op.len());
+        if pos >= op.ref_start && pos < ref_end {
+            return classify_op(ops, i, op, pos, ref_end);
+        }
+    }
+    None
+}
+
+/// Which kind of reference-consuming op a [`CigarCursor`] stands on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SegKind {
+    Match,
+    Deletion,
+    RefSkip,
+    /// Past the last reference-consuming op.
+    Done,
+}
+
+/// A column inside a `D` or `N` with nothing anchored at it: the answer
+/// [`CigarCursor::plain_gap`] gives without walking or looking ahead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlainGap {
+    Deletion(u32),
+    RefSkip,
+}
+
+impl From<PlainGap> for CigarPosInfo {
+    fn from(gap: PlainGap) -> Self {
+        match gap {
+            PlainGap::Deletion(del_len) => Self::Deletion { del_len },
+            PlainGap::RefSkip => Self::RefSkip,
+        }
+    }
+}
+
+/// `del_after` when no deletion follows. A real `D` op may have length 0,
+/// which htslib (and [`CigarMapping::deletion_after_at`]) still report.
+const NO_DELETION: u32 = u32::MAX;
+
+// r[impl perf.cigar_cursor]
+/// One read's position in its own CIGAR, advanced as the pileup moves right —
+/// the shape of htslib's `resolve_cigar2`, which keeps the current op index
+/// with its reference and query start per read.
+///
+/// The cursor stands on one reference-consuming op at a time and has already
+/// looked past it: the insertion or deletion that follows is resolved once,
+/// when the cursor arrives on the op, not re-derived at every column. So the
+/// common column — inside an op, not its indel anchor — is one compare (and,
+/// for a match, one add) in [`plain_match`](Self::plain_match) or
+/// [`plain_gap`](Self::plain_gap), whatever the CIGAR looks like. Everything else goes through [`step`](Self::step), which walks
+/// forward at most to the op covering the column.
+///
+/// Answers match [`CigarMapping::pos_info_at`] and
+/// [`CigarMapping::deletion_after_at`] exactly, for positions that never
+/// decrease. It reads the ops from the store's CIGAR slab by index, so the
+/// ops are never copied.
+#[derive(Clone, Debug)]
+pub(crate) struct CigarCursor {
+    /// First reference position of the op the cursor stands on.
+    seg_start: u32,
+    /// How many columns from `seg_start` are a plain match: the whole op
+    /// for a match op with nothing anchored at its end, one fewer when an
+    /// indel is, and 0 for any other op.
+    plain_len: u32,
+    /// The same for a `D` or `N` op (anchored: a following insertion makes
+    /// the last column a `ComplexIndel`), 0 for any other op. Kept apart from
+    /// `plain_len` so the match test stays one compare with no kind check.
+    gap_len: u32,
+    /// Query offset at `seg_start` (match ops only).
+    qstart: u32,
+    /// One past the op's last reference position. 0 before the first step,
+    /// so the first step advances.
+    seg_end: u32,
+    /// Length of the op (the `del_len` of a `D`/`N`).
+    op_len: u32,
+    /// Summed length of the `I` ops right after this op (skipping `P`); 0 = none.
+    ins_after: u32,
+    /// Length of the `D` right after a match op (skipping `P`), or [`NO_DELETION`].
+    del_after: u32,
+    kind: SegKind,
+    /// Slab index of the next op to read, and one past this read's last op.
+    next_op: u32,
+    ops_end: u32,
+    /// Reference and query offsets at `next_op`.
+    ref_next: u32,
+    q_next: u32,
+}
+
+impl CigarCursor {
+    /// A cursor before the first op of the read whose ops occupy
+    /// `slab[ops_start..ops_end]` and whose alignment starts at `rec_pos`.
+    pub(crate) fn new(rec_pos: Pos0, ops_start: u32, ops_end: u32) -> Self {
+        Self {
+            seg_start: 0,
+            plain_len: 0,
+            gap_len: 0,
+            qstart: 0,
+            seg_end: 0,
+            op_len: 0,
+            ins_after: 0,
+            del_after: NO_DELETION,
+            kind: SegKind::Done,
+            next_op: ops_start,
+            ops_end,
+            ref_next: rec_pos.as_u32(),
+            q_next: 0,
+        }
+    }
+
+    /// The query offset at `pos` when `pos` is a plain match column of the
+    /// op the cursor stands on — no advance, no indel anchored — else `None`.
+    #[inline(always)]
+    pub(crate) fn plain_match(&self, pos: u32) -> Option<QPos> {
+        // Below `seg_start` the difference wraps past any `plain_len`.
+        let offset = pos.wrapping_sub(self.seg_start);
+        // `advance` only opens a plain run whose query offsets fit in u32.
+        (offset < self.plain_len).then(|| QPos::new(self.qstart.wrapping_add(offset)))
+    }
+
+    /// The same for a `D` or `N` op: spliced reads spend most of their span
+    /// inside an `N`. Asked only after [`plain_match`](Self::plain_match)
+    /// said no, and followed by [`step`](Self::step) when this says no too.
+    #[inline(always)]
+    pub(crate) fn plain_gap(&self, pos: u32) -> Option<PlainGap> {
+        let offset = pos.wrapping_sub(self.seg_start);
+        if offset >= self.gap_len {
+            return None;
+        }
+        match self.kind {
+            SegKind::Deletion => Some(PlainGap::Deletion(self.op_len)),
+            SegKind::RefSkip => Some(PlainGap::RefSkip),
+            SegKind::Match | SegKind::Done => None,
+        }
+    }
+
+    /// What the read shows at `pos`, and the deletion anchored there (for a
+    /// match op only). `pos` must not be smaller than on the previous call.
+    #[inline(never)]
+    pub(crate) fn step(
+        &mut self,
+        slab: &[CigarOp],
+        pos: u32,
+    ) -> Option<(CigarPosInfo, Option<u32>)> {
+        if pos >= self.seg_end {
+            self.advance(slab, pos);
+        }
+        // Also the `Done` case, whose span starts at `u32::MAX`.
+        if pos < self.seg_start {
+            return None;
+        }
+        let last = pos.wrapping_add(1) == self.seg_end;
+        match self.kind {
+            SegKind::Match => {
+                let qpos = QPos::new(self.qstart.checked_add(pos.wrapping_sub(self.seg_start))?);
+                if !last {
+                    return Some((CigarPosInfo::Match { qpos }, None));
+                }
+                if self.ins_after > 0 {
+                    return Some((
+                        CigarPosInfo::Insertion { qpos, insert_len: self.ins_after },
+                        None,
+                    ));
+                }
+                let del = (self.del_after != NO_DELETION).then_some(self.del_after);
+                Some((CigarPosInfo::Match { qpos }, del))
+            }
+            SegKind::Deletion | SegKind::RefSkip => {
+                let is_refskip = self.kind == SegKind::RefSkip;
+                if last && self.ins_after > 0 {
+                    return Some((
+                        CigarPosInfo::ComplexIndel {
+                            del_len: self.op_len,
+                            insert_len: self.ins_after,
+                            is_refskip,
+                        },
+                        None,
+                    ));
+                }
+                if is_refskip {
+                    Some((CigarPosInfo::RefSkip, None))
+                } else {
+                    Some((CigarPosInfo::Deletion { del_len: self.op_len }, None))
+                }
+            }
+            SegKind::Done => None,
+        }
+    }
+
+    /// Walk forward to the reference-consuming op covering `pos`, or to the
+    /// first one after it when `pos` is still before the alignment.
+    fn advance(&mut self, slab: &[CigarOp], pos: u32) {
+        while self.next_op < self.ops_end {
+            let Some(&op) = slab.get(self.next_op as usize) else { break };
+            self.next_op = self.next_op.wrapping_add(1);
+            let len = op.len();
+            let kind = match op.op_code() {
+                CIGAR_M | CIGAR_EQ | CIGAR_X => SegKind::Match,
+                CIGAR_D => SegKind::Deletion,
+                CIGAR_N => SegKind::RefSkip,
+                CIGAR_I | CIGAR_S => {
+                    self.q_next = self.q_next.saturating_add(len);
+                    continue;
+                }
+                _ => continue,
+            };
+            let start = self.ref_next;
+            let qstart = self.q_next;
+            let Some(end) = start.checked_add(len) else { break };
+            self.ref_next = end;
+            if kind == SegKind::Match {
+                self.q_next = self.q_next.saturating_add(len);
+            }
+            // A zero-length op covers nothing; an op ending at or before
+            // `pos` is already behind the pileup.
+            if end <= pos || len == 0 {
+                continue;
+            }
+            let (ins_after, del_after) = self.peek_indel_after(slab);
+            let del_after = if kind == SegKind::Match { del_after } else { NO_DELETION };
+            let anchored = ins_after > 0 || del_after != NO_DELETION;
+            let run = len.wrapping_sub(u32::from(anchored));
+            let (plain_len, gap_len) = match kind {
+                SegKind::Match if qstart.checked_add(len).is_some() => (run, 0),
+                SegKind::Deletion | SegKind::RefSkip => (0, run),
+                SegKind::Match | SegKind::Done => (0, 0),
+            };
+            self.seg_start = start;
+            self.plain_len = plain_len;
+            self.gap_len = gap_len;
+            self.qstart = qstart;
+            self.seg_end = end;
+            self.op_len = len;
+            self.ins_after = ins_after;
+            self.del_after = del_after;
+            self.kind = kind;
+            return;
+        }
+        self.seg_start = u32::MAX;
+        self.plain_len = 0;
+        self.gap_len = 0;
+        self.seg_end = u32::MAX;
+        self.kind = SegKind::Done;
+    }
+
+    // r[impl pileup_indel.insertion_len]
+    /// The indel right after the op the cursor just stepped onto: the summed
+    /// `I` run, or the `D` length, skipping `P` ops the way htslib does —
+    /// the same answers as `next_insertion_len` and `next_deletion_len`.
+    fn peek_indel_after(&self, slab: &[CigarOp]) -> (u32, u32) {
+        let mut i = self.next_op;
+        let mut ins = 0u32;
+        let mut seen_insertion = false;
+        while i < self.ops_end {
+            let Some(op) = slab.get(i as usize) else { break };
+            i = i.wrapping_add(1);
+            match op.op_code() {
+                CIGAR_P => {}
+                CIGAR_I => {
+                    seen_insertion = true;
+                    ins = ins.saturating_add(op.len());
+                }
+                CIGAR_D if !seen_insertion => return (0, op.len()),
+                _ => break,
+            }
+        }
+        (ins, NO_DELETION)
+    }
+}
+
+// r[impl cigar.soft_clip_qpos]
+/// The soft clips on either side of an alignment, as
+/// [`CigarMapping::soft_clip_qpos_at`] sees them, resolved from the raw ops
+/// for callers that do not hold a `CigarMapping`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ClipFlanks {
+    /// First aligned reference position; the leading clip ends just before it.
+    lead_start: i64,
+    lead_len: u32,
+    /// Query offset one past the leading clip.
+    lead_qend: i64,
+    /// Reference position one past the alignment; the trailing clip starts here.
+    trail_start: i64,
+    trail_len: u32,
+    /// Query offset of the trailing clip's first base.
+    trail_qstart: i64,
+}
+
+impl ClipFlanks {
+    pub(crate) fn new(rec_pos: Pos0, ops: &[CigarOp], query_len: u32) -> Self {
+        let aln_start = rec_pos.as_i64();
+        // The two `CigarMapping` shapes size the clips differently, and the
+        // engine's answers must not depend on which one it would have built.
+        if let Some((query_offset, match_len)) = try_linear(ops) {
+            let aligned_end = query_offset.saturating_add(match_len);
+            return Self {
+                lead_start: aln_start,
+                lead_len: query_offset,
+                lead_qend: i64::from(query_offset),
+                trail_start: aln_start.saturating_add(i64::from(match_len)),
+                trail_len: query_len.saturating_sub(aligned_end),
+                trail_qstart: i64::from(query_offset).saturating_add(i64::from(match_len)),
+            };
+        }
+        let mut flanks = Self {
+            lead_start: aln_start,
+            lead_len: 0,
+            lead_qend: 0,
+            trail_start: 0,
+            trail_len: 0,
+            trail_qstart: 0,
+        };
+        if let Some(op) = ops.iter().find(|op| op.op_code() != CIGAR_H)
+            && op.op_code() == CIGAR_S
+        {
+            flanks.lead_len = op.len();
+            flanks.lead_qend = i64::from(op.len());
+        }
+        if let Some(i) = ops.iter().rposition(|op| op.op_code() != CIGAR_H)
+            && let Some(op) = ops.get(i)
+            && op.op_code() == CIGAR_S
+        {
+            let before = ops.get(..i).unwrap_or(&[]);
+            let ref_len: i64 =
+                before.iter().filter(|o| o.consumes_ref()).map(|o| i64::from(o.len())).sum();
+            flanks.trail_start = aln_start.saturating_add(ref_len);
+            flanks.trail_len = op.len();
+            flanks.trail_qstart = i64::from(
+                before
+                    .iter()
+                    .filter(|o| o.consumes_query())
+                    .fold(0u32, |acc, o| acc.saturating_add(o.len())),
+            );
+        }
+        flanks
+    }
+
+    /// The soft-clipped base projected onto `pos`, within `max_overhang` of
+    /// the alignment.
+    pub(crate) fn qpos_at(&self, pos: Pos0, max_overhang: u32) -> Option<QPos> {
+        let pos = pos.as_i64();
+        let lead_d = self.lead_start.checked_sub(pos)?;
+        if lead_d >= 1 && lead_d <= i64::from(max_overhang.min(self.lead_len)) {
+            return u32::try_from(self.lead_qend.checked_sub(lead_d)?).ok().map(QPos::new);
+        }
+        let trail_d = pos.checked_sub(self.trail_start)?;
+        if trail_d >= 0 && trail_d < i64::from(max_overhang.min(self.trail_len)) {
+            return u32::try_from(self.trail_qstart.checked_add(trail_d)?).ok().map(QPos::new);
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::arithmetic_side_effects, reason = "test arithmetic on known small values")]
+mod tests {
+    use super::*;
+    use hegel::prelude::*;
+
+    fn op(op_type: CigarOpType, len: u32) -> CigarOp {
+        CigarOp::new(op_type, len)
+    }
+
+    // r[verify bam.owned_record.cigar_op]
+    #[test]
+    fn cigar_op_roundtrip_all_ops() {
+        let ops = [
+            (CigarOpType::Match, CIGAR_M),
+            (CigarOpType::Insertion, CIGAR_I),
+            (CigarOpType::Deletion, CIGAR_D),
+            (CigarOpType::RefSkip, CIGAR_N),
+            (CigarOpType::SoftClip, CIGAR_S),
+            (CigarOpType::HardClip, CIGAR_H),
+            (CigarOpType::Padding, CIGAR_P),
+            (CigarOpType::SeqMatch, CIGAR_EQ),
+            (CigarOpType::SeqMismatch, CIGAR_X),
+        ];
+        for (op_type, code) in ops {
+            assert_eq!(op_type.to_bam_code(), code, "to_bam_code failed for {op_type:?}");
+            assert_eq!(CigarOpType::from_bam(code), op_type, "from_bam failed for code {code}");
+
+            let cigar_op = CigarOp::new(op_type, 42);
+            let packed = cigar_op.to_bam_u32();
+            let decoded = CigarOp::from_bam_u32(packed);
+            assert_eq!(decoded, cigar_op, "round-trip failed for {op_type:?}");
+        }
+    }
+
+    #[test]
+    fn cigar_op_max_length() {
+        // Upper 28 bits can hold up to 2^28 - 1 = 268_435_455
+        let max_len = (1u32 << 28) - 1;
+        let op = CigarOp::new(CigarOpType::Match, max_len);
+        let packed = op.to_bam_u32();
+        let decoded = CigarOp::from_bam_u32(packed);
+        assert_eq!(decoded.len(), max_len);
+        assert_eq!(decoded.op_type(), CigarOpType::Match);
+    }
+
+    #[test]
+    fn cigar_op_unknown_code_round_trips() {
+        // Op codes 9..=15 are reserved; they decode to Unknown and round-trip verbatim.
+        let packed = (100u32 << 4) | 9;
+        let op = CigarOp::from_bam_u32(packed);
+        assert_eq!(op.op_type(), CigarOpType::Unknown(9));
+        assert_eq!(op.len(), 100);
+        assert_eq!(op.to_bam_u32(), packed);
+        // Unknown ops consume neither ref nor query.
+        assert!(!op.consumes_ref());
+        assert!(!op.consumes_query());
+    }
+
+    // r[verify cigar.compact_op_position_invariant]
+    #[test]
+    fn compact_op_ref_start_fits_i32_for_bam_positions() {
+        // BAM positions are i32 (max 2^31-1 = 2_147_483_647).
+        // CompactOp stores ref_start as i32. Verify it works at the maximum BAM position.
+        let cigar = [op(CigarOpType::Match, 100)];
+        let rec_pos = Pos0::new((i32::MAX as u32) - 100).unwrap(); // near max BAM position
+        let mapping = CigarMapping::new(rec_pos, &cigar).unwrap();
+        // Should work fine — position fits in i32
+        assert!(matches!(mapping, CigarMapping::Linear { .. }));
+        assert_eq!(mapping.pos_info_at(rec_pos), Some(CigarPosInfo::Match { qpos: QPos::new(0) }));
+    }
+
+    #[test]
+    fn cigar_op_type_display_matches_sam_spec() {
+        assert_eq!(CigarOpType::Match.to_string(), "M");
+        assert_eq!(CigarOpType::Insertion.to_string(), "I");
+        assert_eq!(CigarOpType::Deletion.to_string(), "D");
+        assert_eq!(CigarOpType::RefSkip.to_string(), "N");
+        assert_eq!(CigarOpType::SoftClip.to_string(), "S");
+        assert_eq!(CigarOpType::HardClip.to_string(), "H");
+        assert_eq!(CigarOpType::Padding.to_string(), "P");
+        assert_eq!(CigarOpType::SeqMatch.to_string(), "=");
+        assert_eq!(CigarOpType::SeqMismatch.to_string(), "X");
+        assert_eq!(CigarOpType::Unknown(9).to_string(), "?");
+    }
+
+    #[test]
+    fn cigar_op_display_concatenates_len_and_op() {
+        assert_eq!(op(CigarOpType::Match, 10).to_string(), "10M");
+        assert_eq!(op(CigarOpType::Insertion, 2).to_string(), "2I");
+        assert_eq!(op(CigarOpType::SeqMatch, 4).to_string(), "4=");
+    }
+
+    #[test]
+    fn cigar_str_renders_full_cigar() {
+        let ops = [
+            op(CigarOpType::Match, 10),
+            op(CigarOpType::Insertion, 2),
+            op(CigarOpType::Deletion, 3),
+        ];
+        assert_eq!(CigarStr(&ops).to_string(), "10M2I3D");
+
+        let clipped = [
+            op(CigarOpType::SoftClip, 5),
+            op(CigarOpType::Match, 50),
+            op(CigarOpType::SoftClip, 3),
+        ];
+        assert_eq!(CigarStr(&clipped).to_string(), "5S50M3S");
+
+        assert_eq!(CigarStr(&[]).to_string(), "");
+    }
+
+    // r[verify cigar.qpos_bounds]
+    #[test]
+    fn linear_cigar_mapping_bounds_check() {
+        // 5S + 100M: rec_pos=1000, query_offset=5, match_len=100
+        let cigar = [op(CigarOpType::SoftClip, 5), op(CigarOpType::Match, 100)];
+
+        let mapping = CigarMapping::new(Pos0::new(1000).unwrap(), &cigar).unwrap();
+        assert!(matches!(mapping, CigarMapping::Linear { .. }));
+
+        // Valid positions: 1000..1100
+        assert_eq!(
+            mapping.pos_info_at(Pos0::new(1000).unwrap()),
+            Some(CigarPosInfo::Match { qpos: QPos::new(5) })
+        );
+        assert_eq!(
+            mapping.pos_info_at(Pos0::new(1050).unwrap()),
+            Some(CigarPosInfo::Match { qpos: QPos::new(55) })
+        );
+        assert_eq!(
+            mapping.pos_info_at(Pos0::new(1099).unwrap()),
+            Some(CigarPosInfo::Match { qpos: QPos::new(104) })
+        );
+
+        // Out-of-range: before alignment start
+        assert_eq!(
+            mapping.pos_info_at(Pos0::new(999).unwrap()),
+            None,
+            "pos before rec_pos must return None"
+        );
+
+        // Out-of-range: at/past alignment end
+        assert_eq!(
+            mapping.pos_info_at(Pos0::new(1100).unwrap()),
+            None,
+            "pos at rec_pos + match_len must return None"
+        );
+        assert_eq!(
+            mapping.pos_info_at(Pos0::new(1200).unwrap()),
+            None,
+            "pos past alignment end must return None"
+        );
+
+        // Far out-of-range (would wrap with unsigned subtraction)
+        assert_eq!(
+            mapping.pos_info_at(Pos0::new(0).unwrap()),
+            None,
+            "pos far before alignment must return None"
+        );
+    }
+
+    fn p(pos: u32) -> Pos0 {
+        Pos0::new(pos).unwrap()
+    }
+
+    // r[verify cigar.soft_clip_qpos]
+    #[test]
+    fn soft_clip_qpos_linear_leading_and_trailing() {
+        // 5S 100M 3S: rec_pos=1000, query_offset=5, match_len=100, query_len=108.
+        let cigar = [
+            op(CigarOpType::SoftClip, 5),
+            op(CigarOpType::Match, 100),
+            op(CigarOpType::SoftClip, 3),
+        ];
+        let m = CigarMapping::new(p(1000), &cigar).unwrap();
+        assert!(matches!(m, CigarMapping::Linear { .. }));
+        let q = |pos, k| m.soft_clip_qpos_at(p(pos), k, 108);
+
+        // Leading: the base adjacent to the alignment (pos 999) is the last clip base (qpos 4).
+        assert_eq!(q(999, 1), Some(QPos::new(4)));
+        assert_eq!(q(998, 1), None, "overhang 1 reaches only one base");
+        assert_eq!(q(998, 2), Some(QPos::new(3)));
+        assert_eq!(q(995, 5), Some(QPos::new(0)), "first leading clip base");
+        assert_eq!(q(994, 5), None, "beyond the 5bp leading clip");
+        assert_eq!(q(994, 9), None, "overhang capped by clip length");
+
+        // Trailing: pos 1100 is the first trailing clip base (qpos 105).
+        assert_eq!(q(1100, 1), Some(QPos::new(105)));
+        assert_eq!(q(1102, 3), Some(QPos::new(107)), "last trailing clip base");
+        assert_eq!(q(1103, 3), None, "beyond the 3bp trailing clip");
+
+        // Inside the alignment and overhang 0 yield nothing.
+        assert_eq!(q(1050, 5), None);
+        assert_eq!(q(999, 0), None);
+    }
+
+    #[test]
+    fn soft_clip_qpos_no_clip_returns_none() {
+        let cigar = [op(CigarOpType::Match, 50)];
+        let m = CigarMapping::new(p(200), &cigar).unwrap();
+        assert_eq!(m.soft_clip_qpos_at(p(199), 1, 50), None);
+        assert_eq!(m.soft_clip_qpos_at(p(250), 1, 50), None);
+    }
+
+    #[test]
+    fn soft_clip_qpos_hard_clip_excluded_from_seq() {
+        // 2H 5S 100M: hard clip is not in SEQ, so query_offset stays 5 and qpos
+        // indexes SEQ directly. query_len (SEQ) = 105.
+        let cigar = [
+            op(CigarOpType::HardClip, 2),
+            op(CigarOpType::SoftClip, 5),
+            op(CigarOpType::Match, 100),
+        ];
+        let m = CigarMapping::new(p(1000), &cigar).unwrap();
+        assert_eq!(m.soft_clip_qpos_at(p(999), 1, 105), Some(QPos::new(4)));
+    }
+
+    #[test]
+    fn soft_clip_qpos_complex_mapping() {
+        // 5S 10M 2I 10M 3S forces the Complex path (insertion). aln spans
+        // 1000..1020; trailing clip query starts at 5+10+2+10 = 27.
+        let cigar = [
+            op(CigarOpType::SoftClip, 5),
+            op(CigarOpType::Match, 10),
+            op(CigarOpType::Insertion, 2),
+            op(CigarOpType::Match, 10),
+            op(CigarOpType::SoftClip, 3),
+        ];
+        let m = CigarMapping::new(p(1000), &cigar).unwrap();
+        assert!(matches!(m, CigarMapping::Complex(_)));
+        let query_len = 5 + 10 + 2 + 10 + 3;
+        assert_eq!(
+            m.soft_clip_qpos_at(p(999), 1, query_len),
+            Some(QPos::new(4)),
+            "leading partner"
+        );
+        assert_eq!(
+            m.soft_clip_qpos_at(p(995), 5, query_len),
+            Some(QPos::new(0)),
+            "first leading base"
+        );
+        assert_eq!(
+            m.soft_clip_qpos_at(p(1020), 1, query_len),
+            Some(QPos::new(27)),
+            "trailing partner"
+        );
+        assert_eq!(
+            m.soft_clip_qpos_at(p(1022), 3, query_len),
+            Some(QPos::new(29)),
+            "last trailing base"
+        );
+        assert_eq!(m.soft_clip_qpos_at(p(1023), 3, query_len), None);
+    }
+
+    /// For an arbitrary clips-match-clips CIGAR, `soft_clip_qpos_at` MUST be
+    /// the exact complement of `pos_info_at` over the flanking windows:
+    /// never both `Some` at one position, every hit indexes the correct
+    /// clip run, and the number of hits per side is exactly
+    /// `min(overhang, clip_len)`.
+    // r[verify cigar.soft_clip_qpos]
+    #[hegel::test]
+    fn soft_clip_qpos_windows(tc: TestCase) {
+        let rec_pos = tc.draw(gs::integers::<u32>().min_value(100).max_value(999));
+        let lead = tc.draw(gs::integers::<u32>().max_value(4));
+        let mlen = tc.draw(gs::integers::<u32>().min_value(1).max_value(9));
+        let trail = tc.draw(gs::integers::<u32>().max_value(4));
+        let overhang = tc.draw(gs::integers::<u32>().max_value(5));
+
+        let mut ops = Vec::new();
+        if lead > 0 {
+            ops.push(op(CigarOpType::SoftClip, lead));
+        }
+        ops.push(op(CigarOpType::Match, mlen));
+        if trail > 0 {
+            ops.push(op(CigarOpType::SoftClip, trail));
+        }
+        let query_len = lead + mlen + trail;
+        let m = CigarMapping::new(p(rec_pos), &ops).unwrap();
+
+        let aln_start = rec_pos;
+        let aln_end = rec_pos + mlen; // one past the last aligned base
+
+        let lo = aln_start.saturating_sub(overhang + 2);
+        let hi = aln_end + overhang + 2;
+        let mut lead_hits = 0u32;
+        let mut trail_hits = 0u32;
+        for pos in lo..hi {
+            let pp = p(pos);
+            let sc = m.soft_clip_qpos_at(pp, overhang, query_len);
+            let aligned = m.pos_info_at(pp);
+            assert!(
+                !(sc.is_some() && aligned.is_some()),
+                "soft clip and aligned base cannot coexist at one position"
+            );
+            if let Some(q) = sc {
+                assert!(q.get() < query_len);
+                if pos < aln_start {
+                    assert!(q.get() < lead, "leading hit must index the leading clip run");
+                    lead_hits += 1;
+                } else {
+                    assert!(
+                        q.get() >= lead + mlen,
+                        "trailing hit must index the trailing clip run"
+                    );
+                    trail_hits += 1;
+                }
+            }
+        }
+        assert_eq!(lead_hits, overhang.min(lead));
+        assert_eq!(trail_hits, overhang.min(trail));
+    }
+
+    // r[verify cigar.slice_from_bam_bytes]
+    /// Round-trip: encode `CigarOp` → BAM LE bytes → `slice_from_bam_bytes` → same ops.
+    #[hegel::test]
+    fn roundtrip_slice_from_bam_bytes(tc: TestCase) {
+        let ops: Vec<CigarOp> = tc
+            .draw(
+                gs::vecs(gs::tuples!(
+                    gs::integers::<u32>().max_value(8),
+                    gs::integers::<u32>().min_value(1).max_value(999),
+                ))
+                .min_size(1)
+                .max_size(19),
+            )
+            .into_iter()
+            .map(|(code, len)| CigarOp::from_bam_u32((len << 4) | code))
+            .collect();
+
+        let bytes: Vec<u8> = ops.iter().flat_map(|op| op.to_bam_u32().to_le_bytes()).collect();
+        // 8 bytes padding ensures 8-byte alignment (≥ 4-byte for CigarOp)
+        let mut buf = vec![0u8; 8];
+        buf.extend_from_slice(&bytes);
+        let aligned = &buf[8..];
+
+        let result = CigarOp::slice_from_bam_bytes(aligned);
+        assert!(result.is_some(), "aligned buffer must succeed");
+        assert_eq!(result.unwrap(), ops.as_slice());
+    }
+
+    #[test]
+    fn slice_from_bam_bytes_rejects_odd_length() {
+        assert!(CigarOp::slice_from_bam_bytes(&[0u8; 7]).is_none());
+    }
+
+    #[test]
+    fn slice_from_bam_bytes_empty_ok() {
+        assert_eq!(CigarOp::slice_from_bam_bytes(&[]), Some(&[][..]));
+    }
+
+    // r[verify cigar.slice_from_bam_bytes]
+    #[test]
+    fn slice_from_bam_bytes_rejects_unaligned_input() {
+        // BAM CIGAR data can be unaligned within the record: the read name
+        // sits between the 32-byte fixed header and the CIGAR data. If
+        // l_read_name is not a multiple of 4, the CIGAR bytes start at a
+        // non-4-byte-aligned offset. Samtools produces such records.
+        let cigar_op = CigarOp::new(CigarOpType::Match, 100);
+        let packed = cigar_op.to_bam_u32();
+        let mut buf = vec![0u8];
+        buf.extend_from_slice(&packed.to_le_bytes());
+        buf.extend_from_slice(&packed.to_le_bytes());
+        buf.extend_from_slice(&packed.to_le_bytes());
+
+        let mut any_unaligned = false;
+        for off in 0..=3 {
+            let sub = &buf[off..off + 4];
+            let result = CigarOp::slice_from_bam_bytes(sub);
+            if !(sub.as_ptr() as usize).is_multiple_of(4) {
+                assert!(result.is_none(), "unaligned slice at offset {off} must return None");
+                any_unaligned = true;
+            }
+        }
+        assert!(any_unaligned, "at least one test offset must be unaligned");
+    }
+
+    const ALL_OPS: [CigarOpType; 9] = [
+        CigarOpType::Match,
+        CigarOpType::Insertion,
+        CigarOpType::Deletion,
+        CigarOpType::RefSkip,
+        CigarOpType::SoftClip,
+        CigarOpType::HardClip,
+        CigarOpType::Padding,
+        CigarOpType::SeqMatch,
+        CigarOpType::SeqMismatch,
+    ];
+
+    #[hegel::composite]
+    fn arb_ops(tc: &TestCase) -> Vec<CigarOp> {
+        let n = tc.draw_silent(gs::integers::<usize>().min_value(1).max_value(10));
+        (0..n)
+            .map(|_| {
+                let t = tc.draw_silent(gs::sampled_from(&ALL_OPS));
+                op(t, tc.draw_silent(gs::integers::<u32>().max_value(6)))
+            })
+            .collect()
+    }
+
+    // r[verify perf.cigar_cursor]
+    // r[verify pileup_indel.insertion_len]
+    /// Walking the cursor over any non-decreasing sequence of positions —
+    /// including jumps over several ops, which a pileup starting mid-read
+    /// makes — gives the stateless lookups' answers at every one of them, and
+    /// the plain fast path never answers where they would say more.
+    #[hegel::test]
+    fn cursor_agrees_with_stateless_lookup(tc: TestCase) {
+        let ops = tc.draw(arb_ops().print_as_debug());
+        let rec_pos = tc.draw(gs::integers::<u32>().max_value(20));
+        let steps = tc.draw(gs::vecs(gs::integers::<u32>().max_value(4)).max_size(40));
+        // The slab holds other reads' ops on either side.
+        let mut slab = vec![op(CigarOpType::Deletion, 3), op(CigarOpType::Insertion, 2)];
+        let start = u32::try_from(slab.len()).unwrap();
+        slab.extend_from_slice(&ops);
+        slab.push(op(CigarOpType::Deletion, 5));
+        let end = start + u32::try_from(ops.len()).unwrap();
+
+        let mapping = CigarMapping::new(p(rec_pos), &ops).unwrap();
+        let mut cursor = CigarCursor::new(p(rec_pos), start, end);
+        let mut pos = 0u32;
+        for step in steps {
+            pos += step;
+            let expected = mapping.pos_info_at(p(pos)).map(|info| {
+                let del = match info {
+                    CigarPosInfo::Match { .. } => mapping.deletion_after_at(p(pos)),
+                    _ => None,
+                };
+                (info, del)
+            });
+            if let Some(qpos) = cursor.plain_match(pos) {
+                assert_eq!(expected, Some((CigarPosInfo::Match { qpos }, None)), "pos {pos}");
+            } else if let Some(gap) = cursor.plain_gap(pos) {
+                assert_eq!(expected, Some((gap.into(), None)), "pos {pos}");
+            } else {
+                assert_eq!(cursor.step(&slab, pos), expected, "pos {pos}");
+            }
+        }
+    }
+
+    // r[verify cigar.soft_clip_qpos]
+    /// The flanks resolved from raw ops project the same soft-clipped base
+    /// as `CigarMapping::soft_clip_qpos_at`, for either mapping shape.
+    #[hegel::test]
+    fn clip_flanks_agree_with_mapping(tc: TestCase) {
+        let ops = tc.draw(arb_ops().print_as_debug());
+        let rec_pos = tc.draw(gs::integers::<u32>().max_value(20));
+        let overhang = tc.draw(gs::integers::<u32>().max_value(4));
+        let query_len = tc.draw(gs::integers::<u32>().max_value(40));
+        let mapping = CigarMapping::new(p(rec_pos), &ops).unwrap();
+        let flanks = ClipFlanks::new(p(rec_pos), &ops, query_len);
+        for pos in 0..80 {
+            assert_eq!(
+                flanks.qpos_at(p(pos), overhang),
+                mapping.soft_clip_qpos_at(p(pos), overhang, query_len),
+                "pos {pos}"
+            );
+        }
+    }
+}

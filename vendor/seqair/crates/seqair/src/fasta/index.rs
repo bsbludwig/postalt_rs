@@ -1,0 +1,621 @@
+//! Parse FAI indexes to locate sequences within a FASTA file. [`FastaIndex`] maps sequence
+//! names to [`FaiEntry`] offsets and line widths; used by [`IndexedFastaReader`](super::IndexedFastaReader)
+//! to seek directly to any subsequence.
+
+use rustc_hash::FxHashMap;
+use seqair_types::SmolStr;
+use std::path::Path;
+use tracing::instrument;
+
+// r[impl io.errors]
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum FaiError {
+    #[error("I/O error reading FAI index {path}")]
+    Read { path: std::path::PathBuf, source: std::io::Error },
+
+    #[error("FAI index {path} is empty")]
+    Empty { path: std::path::PathBuf },
+
+    #[error("FAI index {path} line {line_number}: {kind}")]
+    InvalidEntry { path: std::path::PathBuf, line_number: usize, kind: FaiEntryError },
+}
+
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum FaiEntryError {
+    #[error("expected 5 (FASTA) or 6 (FASTQ) tab-separated fields, found {found}")]
+    TooFewFields { found: usize },
+
+    #[error("expected 5 (FASTA) or 6 (FASTQ) tab-separated fields, found {found}")]
+    TooManyFields { found: usize },
+
+    #[error("invalid {field} value {raw_value:?}: not a valid integer")]
+    InvalidField { field: &'static str, raw_value: String },
+
+    #[error("linebases is 0 (would cause division by zero) for sequence {name:?}")]
+    ZeroLinebases { name: SmolStr },
+
+    #[error("linewidth ({linewidth}) < linebases ({linebases}) for sequence {name:?}")]
+    LinewidthTooSmall { name: SmolStr, linebases: u64, linewidth: u64 },
+
+    #[error(
+        "line terminator is {terminator} bytes (linewidth {linewidth} - linebases {linebases}) \
+         for sequence {name:?}; at most 2 (CRLF) is possible"
+    )]
+    LineTerminatorTooLong { name: SmolStr, linebases: u64, linewidth: u64, terminator: u64 },
+
+    #[error("sequence length is 0 for sequence {name:?}")]
+    ZeroLength { name: SmolStr },
+
+    #[error(
+        "qual_offset ({qual_offset}) is not past the sequence offset ({offset}) for sequence \
+         {name:?}; the quality block always follows the sequence block"
+    )]
+    QualBeforeSequence { name: SmolStr, offset: u64, qual_offset: u64 },
+
+    #[error("duplicate sequence name {name:?}")]
+    DuplicateName { name: SmolStr },
+}
+
+/// A single entry from a `.fai` index file.
+///
+/// The same type covers FASTA and FASTQ. A FASTQ index carries one extra
+/// column, `qual_offset`, and the sequence-block geometry (`offset`,
+/// `linebases`, `linewidth`) means exactly the same thing in both.
+#[derive(Debug, Clone)]
+pub struct FaiEntry {
+    pub name: SmolStr,
+    pub length: u64,
+    pub offset: u64,
+    pub linebases: u64,
+    pub linewidth: u64,
+    // r[impl fastq.access.index_format]
+    /// Byte offset of the record's quality block. `Some` only for a FASTQ
+    /// (6-column) index; always `None` for FASTA.
+    pub qual_offset: Option<u64>,
+}
+
+impl FaiEntry {
+    // r[impl fasta.index.offset_calculation]
+    // r[impl fasta.index.terminator_bound]
+    /// Byte offset of the base at 0-based position `pos`, or `None` if
+    /// `linebases == 0` (division by zero) or the entry's `offset` combined
+    /// with `pos` overflows `u64` — either way a hostile or corrupt entry,
+    /// since a real `.fai` never produces either. Checked rather than
+    /// wrapping arithmetic matters here: `offset` is untrusted and can sit
+    /// near `u64::MAX`, and wrapping would silently fold it back into a
+    /// small, in-bounds-looking offset instead of surfacing the corruption.
+    pub fn byte_offset(&self, pos: u64) -> Option<u64> {
+        self.offset_from(self.offset, pos)
+    }
+
+    // r[impl fastq.access.indexed_qual]
+    /// Byte offset of the quality character for `pos`, or `None` for a FASTA
+    /// index or on failure (see [`byte_offset`](Self::byte_offset)).
+    /// `samtools fqidx` likewise assumes the quality block repeats the
+    /// sequence block's line geometry.
+    pub fn qual_byte_offset(&self, pos: u64) -> Option<u64> {
+        self.offset_from(self.qual_offset?, pos)
+    }
+
+    // `FaiEntry`'s fields are public, so a caller can build one directly with
+    // `linebases == 0` without going through the parser's `ZeroLinebases`
+    // check — this MUST NOT rely on that check as an invariant. `checked_div`/
+    // `checked_rem` fail closed via `?` instead of panicking.
+    fn offset_from(&self, base: u64, pos: u64) -> Option<u64> {
+        let line = pos.checked_div(self.linebases)?;
+        let col = pos.checked_rem(self.linebases)?;
+        line.checked_mul(self.linewidth)?.checked_add(col)?.checked_add(base)
+    }
+
+    /// Whether this entry came from a FASTQ (6-column) index.
+    pub fn is_fastq(&self) -> bool {
+        self.qual_offset.is_some()
+    }
+}
+
+// r[impl fasta.index.parse]
+// r[impl fasta.index.name_lookup]
+#[derive(Debug, Clone)]
+pub struct FastaIndex {
+    entries: Vec<FaiEntry>,
+    name_to_idx: FxHashMap<SmolStr, usize>,
+}
+
+impl FastaIndex {
+    #[instrument(level = "debug", fields(path = %path.display()))]
+    pub fn from_file(path: &Path) -> Result<Self, FaiError> {
+        let contents = std::fs::read_to_string(path)
+            .map_err(|source| FaiError::Read { path: path.to_path_buf(), source })?;
+        Self::parse(&contents, path)
+    }
+
+    /// Parse FAI index from string contents.
+    #[cfg(feature = "fuzz")]
+    pub fn from_contents(contents: &str) -> Result<Self, FaiError> {
+        Self::parse(contents, Path::new("<fuzz>"))
+    }
+
+    fn parse(contents: &str, path: &Path) -> Result<Self, FaiError> {
+        let mut entries = Vec::new();
+        let mut name_to_idx = FxHashMap::default();
+
+        for (line_num, line) in contents.lines().enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+
+            // r[impl fasta.index.fields]
+            // r[impl fastq.access.index_parse]
+            // Five fields is FASTA; a sixth is the FASTQ `qual_offset`.
+            let mut fields = line.splitn(7, '\t');
+            let (Some(name_str), Some(len_s), Some(off_s), Some(lb_s), Some(lw_s)) =
+                (fields.next(), fields.next(), fields.next(), fields.next(), fields.next())
+            else {
+                let found = line.split('\t').count();
+                return Err(FaiError::InvalidEntry {
+                    path: path.to_path_buf(),
+                    line_number: line_num.wrapping_add(1),
+                    kind: FaiEntryError::TooFewFields { found },
+                });
+            };
+            let qual_offset_s = fields.next();
+            if fields.next().is_some() {
+                let found = line.split('\t').count();
+                return Err(FaiError::InvalidEntry {
+                    path: path.to_path_buf(),
+                    line_number: line_num.wrapping_add(1),
+                    kind: FaiEntryError::TooManyFields { found },
+                });
+            }
+
+            let name = SmolStr::new(name_str);
+            let length = parse_fai_field(len_s, "length", line_num, path)?;
+            let offset = parse_fai_field(off_s, "offset", line_num, path)?;
+            let linebases = parse_fai_field(lb_s, "linebases", line_num, path)?;
+            let linewidth = parse_fai_field(lw_s, "linewidth", line_num, path)?;
+            let qual_offset = qual_offset_s
+                .map(|s| parse_fai_field(s, "qual_offset", line_num, path))
+                .transpose()?;
+
+            // r[impl fasta.index.validation]
+            if linebases == 0 {
+                return Err(FaiError::InvalidEntry {
+                    path: path.to_path_buf(),
+                    line_number: line_num.wrapping_add(1),
+                    kind: FaiEntryError::ZeroLinebases { name },
+                });
+            }
+            if linewidth < linebases {
+                return Err(FaiError::InvalidEntry {
+                    path: path.to_path_buf(),
+                    line_number: line_num.wrapping_add(1),
+                    kind: FaiEntryError::LinewidthTooSmall { name, linebases, linewidth },
+                });
+            }
+            // r[impl fasta.index.terminator_bound]
+            // Without this, `linewidth` is an unbounded multiplier on every
+            // byte offset: a fetch spans `bases * linewidth / linebases` bytes
+            // and is allocated before a single byte is read, so an index
+            // claiming a huge line width turns a small query into a huge
+            // allocation. A real line terminator is LF or CRLF, and 0 means
+            // "one line, no trailing newline" — nothing else is producible.
+            let terminator = linewidth.saturating_sub(linebases);
+            if terminator > 2 {
+                return Err(FaiError::InvalidEntry {
+                    path: path.to_path_buf(),
+                    line_number: line_num.wrapping_add(1),
+                    kind: FaiEntryError::LineTerminatorTooLong {
+                        name,
+                        linebases,
+                        linewidth,
+                        terminator,
+                    },
+                });
+            }
+            if length == 0 {
+                return Err(FaiError::InvalidEntry {
+                    path: path.to_path_buf(),
+                    line_number: line_num.wrapping_add(1),
+                    kind: FaiEntryError::ZeroLength { name },
+                });
+            }
+
+            // r[impl fastq.access.index_format]
+            // The quality block follows the sequence block and the `+` line, so
+            // a non-increasing qual_offset is a corrupt index. This is a
+            // degenerate-case guard only; the enormous-span attack is bounded at
+            // fetch time (see r[fastq.access.indexed_qual]), not here, because
+            // the index carries no length for the quality block.
+            if let Some(qual_offset) = qual_offset
+                && qual_offset <= offset
+            {
+                return Err(FaiError::InvalidEntry {
+                    path: path.to_path_buf(),
+                    line_number: line_num.wrapping_add(1),
+                    kind: FaiEntryError::QualBeforeSequence { name, offset, qual_offset },
+                });
+            }
+
+            if name_to_idx.contains_key(&name) {
+                return Err(FaiError::InvalidEntry {
+                    path: path.to_path_buf(),
+                    line_number: line_num.wrapping_add(1),
+                    kind: FaiEntryError::DuplicateName { name },
+                });
+            }
+
+            name_to_idx.insert(name.clone(), entries.len());
+            entries.push(FaiEntry { name, length, offset, linebases, linewidth, qual_offset });
+        }
+
+        if entries.is_empty() {
+            return Err(FaiError::Empty { path: path.to_path_buf() });
+        }
+
+        Ok(FastaIndex { entries, name_to_idx })
+    }
+
+    pub fn get(&self, name: &str) -> Option<&FaiEntry> {
+        let &idx = self.name_to_idx.get(name)?;
+        self.entries.get(idx)
+    }
+
+    pub fn sequence_names(&self) -> Vec<SmolStr> {
+        self.entries.iter().map(|e| e.name.clone()).collect()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+}
+
+fn parse_fai_field(
+    s: &str,
+    field_name: &'static str,
+    line_num: usize,
+    path: &Path,
+) -> Result<u64, FaiError> {
+    s.parse().map_err(|_| FaiError::InvalidEntry {
+        path: path.to_path_buf(),
+        line_number: line_num.wrapping_add(1),
+        kind: FaiEntryError::InvalidField { field: field_name, raw_value: s.to_string() },
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::arithmetic_side_effects, reason = "test arithmetic is not safety-critical")]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn test_path() -> PathBuf {
+        PathBuf::from("test.fai")
+    }
+
+    // r[verify fasta.index.parse]
+    // r[verify fasta.index.name_lookup]
+    #[test]
+    fn parse_simple_index() {
+        let contents = "seq1\t100\t6\t50\t51\nseq2\t200\t160\t80\t81\n";
+        let idx = FastaIndex::parse(contents, &test_path()).unwrap();
+
+        assert_eq!(idx.len(), 2);
+        let e1 = idx.get("seq1").unwrap();
+        assert_eq!(e1.length, 100);
+        assert_eq!(e1.offset, 6);
+        assert_eq!(e1.linebases, 50);
+        assert_eq!(e1.linewidth, 51);
+
+        let e2 = idx.get("seq2").unwrap();
+        assert_eq!(e2.length, 200);
+        assert_eq!(e2.offset, 160);
+    }
+
+    // r[verify fasta.index.name_lookup]
+    #[test]
+    fn lookup_missing_sequence() {
+        let contents = "seq1\t100\t6\t50\t51\n";
+        let idx = FastaIndex::parse(contents, &test_path()).unwrap();
+        assert!(idx.get("nonexistent").is_none());
+    }
+
+    // r[verify fasta.index.fields]
+    #[test]
+    fn reject_too_few_fields() {
+        let contents = "seq1\t100\t6\t50\n"; // only 4 fields
+        let err = FastaIndex::parse(contents, &test_path()).unwrap_err();
+        match err {
+            FaiError::InvalidEntry {
+                kind: FaiEntryError::TooFewFields { found },
+                line_number,
+                ..
+            } => {
+                assert_eq!(found, 4, "should report 4 fields found");
+                assert_eq!(line_number, 1);
+            }
+            other => panic!("expected TooFewFields, got {other:?}"),
+        }
+    }
+
+    // r[verify fasta.index.fields]
+    #[test]
+    fn reject_too_many_fields() {
+        // Six fields is the valid FASTQ form; seven is nothing.
+        let contents = "seq1\t100\t6\t50\t51\t120\textra\n"; // 7 fields
+        let err = FastaIndex::parse(contents, &test_path()).unwrap_err();
+        match err {
+            FaiError::InvalidEntry {
+                kind: FaiEntryError::TooManyFields { found },
+                line_number,
+                ..
+            } => {
+                assert_eq!(found, 7, "should report 7 fields found");
+                assert_eq!(line_number, 1);
+            }
+            other => panic!("expected TooManyFields, got {other:?}"),
+        }
+    }
+
+    // r[verify fastq.access.index_parse]
+    #[test]
+    fn accepts_six_column_fastq_index() {
+        let contents = "seq1\t100\t6\t50\t51\t120\n";
+        let idx = FastaIndex::parse(contents, &test_path()).unwrap();
+        let e = idx.get("seq1").unwrap();
+        assert_eq!(e.qual_offset, Some(120));
+        // Sequence geometry is unchanged by the extra column.
+        assert_eq!(e.byte_offset(50), Some(6 + 51));
+        // Quality geometry mirrors it from `qual_offset`.
+        assert_eq!(e.qual_byte_offset(50), Some(120 + 51));
+    }
+
+    // r[verify fastq.access.index_format]
+    #[test]
+    fn rejects_qual_offset_not_past_sequence_offset() {
+        // Equal and reversed are both impossible in a real FASTQ record.
+        for qual in ["6", "5"] {
+            let contents = format!("seq1\t100\t6\t50\t51\t{qual}\n");
+            let err = FastaIndex::parse(&contents, &test_path()).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    FaiError::InvalidEntry { kind: FaiEntryError::QualBeforeSequence { .. }, .. }
+                ),
+                "qual_offset={qual}: expected QualBeforeSequence, got {err:?}"
+            );
+        }
+    }
+
+    // r[verify fastq.access.index_format]
+    #[test]
+    fn accepts_qual_offset_just_past_sequence_offset() {
+        // offset=6, qual_offset=7 is legal (quality block starts right after).
+        let contents = "seq1\t100\t6\t50\t51\t7\n";
+        let idx = FastaIndex::parse(contents, &test_path()).unwrap();
+        assert_eq!(idx.get("seq1").unwrap().qual_offset, Some(7));
+    }
+
+    // r[verify fasta.index.terminator_bound]
+    #[test]
+    fn reject_absurd_line_terminator() {
+        // linebases = 1, linewidth = 2^40. Accepted, this makes `linewidth` an
+        // unbounded multiplier on every byte offset: a 100 kb fetch would size
+        // its read buffer at ~97.7 PiB and abort the process on allocation.
+        let contents = "evil\t1000000\t0\t1\t1099511627776\n";
+        let err = FastaIndex::parse(contents, &test_path()).unwrap_err();
+        match err {
+            FaiError::InvalidEntry {
+                kind: FaiEntryError::LineTerminatorTooLong { terminator, .. },
+                ..
+            } => assert_eq!(terminator, 1_099_511_627_775),
+            other => panic!("expected LineTerminatorTooLong, got {other:?}"),
+        }
+    }
+
+    // r[verify fasta.index.terminator_bound]
+    #[test]
+    fn accept_every_real_line_terminator() {
+        // 0 = single line, no trailing newline; 1 = LF; 2 = CRLF.
+        for terminator in 0..=2u64 {
+            let contents = format!("s\t100\t6\t50\t{}\n", 50 + terminator);
+            let idx = FastaIndex::parse(&contents, &test_path())
+                .unwrap_or_else(|e| panic!("terminator {terminator} must be accepted: {e:?}"));
+            assert_eq!(idx.get("s").unwrap().linewidth, 50 + terminator);
+        }
+        // 3 is not producible by any writer.
+        let err = FastaIndex::parse("s\t100\t6\t50\t53\n", &test_path()).unwrap_err();
+        assert!(matches!(
+            err,
+            FaiError::InvalidEntry { kind: FaiEntryError::LineTerminatorTooLong { .. }, .. }
+        ));
+    }
+
+    // r[verify fasta.index.fields]
+    #[test]
+    fn reject_invalid_field_value() {
+        let contents = "chr1\tNOTANUM\t0\t50\t51\n"; // non-integer length
+        let err = FastaIndex::parse(contents, &test_path()).unwrap_err();
+        match err {
+            FaiError::InvalidEntry {
+                kind: FaiEntryError::InvalidField { field, raw_value },
+                line_number,
+                ..
+            } => {
+                assert_eq!(field, "length");
+                assert_eq!(raw_value, "NOTANUM");
+                assert_eq!(line_number, 1);
+            }
+            other => panic!("expected InvalidField, got {other:?}"),
+        }
+    }
+
+    // r[verify fasta.index.fields]
+    #[test]
+    fn reject_invalid_field_via_file() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bad.fai");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(f, "chr1\t1000\tBAD_OFFSET\t50\t51").unwrap();
+        drop(f);
+
+        let err = FastaIndex::from_file(&path).unwrap_err();
+        match err {
+            FaiError::InvalidEntry {
+                kind: FaiEntryError::InvalidField { field, raw_value },
+                ..
+            } => {
+                assert_eq!(field, "offset");
+                assert_eq!(raw_value, "BAD_OFFSET");
+            }
+            other => panic!("expected InvalidField, got {other:?}"),
+        }
+    }
+
+    // r[verify fasta.index.validation]
+    #[test]
+    fn reject_zero_linebases() {
+        let contents = "seq1\t100\t6\t0\t1\n";
+        let err = FastaIndex::parse(contents, &test_path()).unwrap_err();
+        assert!(
+            matches!(err, FaiError::InvalidEntry { kind: FaiEntryError::ZeroLinebases { .. }, .. }),
+            "expected ZeroLinebases, got {err:?}"
+        );
+    }
+
+    // r[verify fasta.index.validation]
+    #[test]
+    fn reject_linewidth_less_than_linebases() {
+        let contents = "seq1\t100\t6\t50\t49\n";
+        let err = FastaIndex::parse(contents, &test_path()).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                FaiError::InvalidEntry { kind: FaiEntryError::LinewidthTooSmall { .. }, .. }
+            ),
+            "expected LinewidthTooSmall, got {err:?}"
+        );
+    }
+
+    // r[verify fasta.index.validation]
+    #[test]
+    fn reject_zero_length() {
+        let contents = "seq1\t0\t6\t50\t51\n";
+        let err = FastaIndex::parse(contents, &test_path()).unwrap_err();
+        assert!(
+            matches!(err, FaiError::InvalidEntry { kind: FaiEntryError::ZeroLength { .. }, .. }),
+            "expected ZeroLength, got {err:?}"
+        );
+    }
+
+    // r[verify fasta.index.name_lookup]
+    #[test]
+    fn reject_duplicate_names() {
+        let contents = "seq1\t100\t6\t50\t51\nseq1\t200\t160\t80\t81\n";
+        let err = FastaIndex::parse(contents, &test_path()).unwrap_err();
+        assert!(
+            matches!(err, FaiError::InvalidEntry { kind: FaiEntryError::DuplicateName { .. }, .. }),
+            "expected DuplicateName, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn reject_empty_index() {
+        let err = FastaIndex::parse("", &test_path()).unwrap_err();
+        assert!(matches!(err, FaiError::Empty { .. }), "expected Empty, got {err:?}");
+    }
+
+    #[test]
+    fn byte_offset_single_line() {
+        // Sequence fits on one line: 4 bases, linebases=4, linewidth=5
+        let entry = FaiEntry {
+            name: "s".into(),
+            length: 4,
+            offset: 6,
+            linebases: 4,
+            linewidth: 5,
+            qual_offset: None,
+        };
+        // pos 0 → offset + 0 = 6
+        assert_eq!(entry.byte_offset(0), Some(6));
+        // pos 3 → offset + 3 = 9
+        assert_eq!(entry.byte_offset(3), Some(9));
+    }
+
+    #[test]
+    fn byte_offset_multi_line() {
+        // 100 bases, 50 per line, linewidth 51 (50 bases + \n)
+        let entry = FaiEntry {
+            name: "s".into(),
+            length: 100,
+            offset: 10,
+            linebases: 50,
+            linewidth: 51,
+            qual_offset: None,
+        };
+        // pos 0 → 10
+        assert_eq!(entry.byte_offset(0), Some(10));
+        // pos 49 → 10 + 49 = 59 (last base of first line)
+        assert_eq!(entry.byte_offset(49), Some(59));
+        // pos 50 → 10 + 1*51 + 0 = 61 (first base of second line, skipping \n)
+        assert_eq!(entry.byte_offset(50), Some(61));
+        // pos 51 → 10 + 1*51 + 1 = 62
+        assert_eq!(entry.byte_offset(51), Some(62));
+    }
+
+    #[test]
+    fn byte_offset_crlf() {
+        // Windows-style line endings: linewidth = linebases + 2
+        let entry = FaiEntry {
+            name: "s".into(),
+            length: 100,
+            offset: 10,
+            linebases: 50,
+            linewidth: 52, // 50 bases + \r\n
+            qual_offset: None,
+        };
+        // pos 50 → 10 + 1*52 + 0 = 62 (skips \r\n)
+        assert_eq!(entry.byte_offset(50), Some(62));
+    }
+
+    // r[verify fasta.index.offset_calculation]
+    /// `FaiEntry`'s fields are public, so a caller can build one with
+    /// `linebases == 0` without going through the parser's `ZeroLinebases`
+    /// check. `byte_offset` must fail closed (`None`), not panic on the
+    /// division its `Option` signature promises to guard against.
+    #[test]
+    fn byte_offset_returns_none_for_hand_built_zero_linebases() {
+        let entry = FaiEntry {
+            name: "s".into(),
+            length: 4,
+            offset: 0,
+            linebases: 0,
+            linewidth: 0,
+            qual_offset: Some(0),
+        };
+        assert_eq!(entry.byte_offset(0), None);
+        assert_eq!(entry.qual_byte_offset(0), None);
+    }
+
+    #[test]
+    fn parse_real_fai() {
+        let contents = "chr19\t61431566\t7\t50\t51\n\
+                         2kb_3_Unmodified\t2018\t62660223\t2018\t2019\n\
+                         bacteriophage_lambda_CpG\t48502\t62662268\t48502\t48503\n";
+        let idx = FastaIndex::parse(contents, &test_path()).unwrap();
+        assert_eq!(idx.len(), 3);
+
+        let chr19 = idx.get("chr19").unwrap();
+        assert_eq!(chr19.length, 61_431_566);
+        assert_eq!(chr19.offset, 7);
+
+        let lambda = idx.get("bacteriophage_lambda_CpG").unwrap();
+        assert_eq!(lambda.length, 48502);
+    }
+}

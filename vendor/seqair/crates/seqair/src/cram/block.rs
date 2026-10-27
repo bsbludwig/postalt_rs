@@ -1,0 +1,829 @@
+//! Parse and decompress CRAM blocks. [`parse_block`] handles all compression methods
+//! defined by CRAM v3: raw, gzip, bzip2, lzma, rANS order-0/1, NX16, the arithmetic coder,
+//! fqzcomp, and tok3.
+
+// See rans.rs: lazy `ok_or_else(|| CramError::...)` keeps error construction and its
+// `drop_in_place<CramError>` off the per-record path.
+#![allow(
+    clippy::unnecessary_lazy_evaluations,
+    reason = "lazy form avoids per-call drop_in_place<CramError> on hot path"
+)]
+
+use super::{codec_scratch::CodecScratch, reader::CramError, varint};
+
+/// Block content types as defined in the CRAM spec.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContentType {
+    FileHeader,
+    CompressionHeader,
+    SliceHeader,
+    ExternalData,
+    CoreData,
+}
+
+impl ContentType {
+    fn from_byte(b: u8) -> Result<Self, CramError> {
+        match b {
+            0 => Ok(Self::FileHeader),
+            1 => Ok(Self::CompressionHeader),
+            2 => Ok(Self::SliceHeader),
+            4 => Ok(Self::ExternalData),
+            5 => Ok(Self::CoreData),
+            _ => Err(CramError::UnknownBlockContentType { content_type: b }),
+        }
+    }
+}
+
+/// A decompressed CRAM block.
+#[derive(Debug)]
+pub struct Block {
+    pub content_type: ContentType,
+    pub content_id: i32,
+    pub data: Vec<u8>,
+}
+
+/// Parse a CRAM block from a byte slice.
+///
+// r[impl cram.block.structure]
+// r[impl cram.block.crc32]
+/// Returns the block and the number of bytes consumed from `buf`.
+///
+/// One-shot entry point for callers outside the reader: it decodes with a
+/// fresh `CodecScratch`, which allocates nothing until a block needs it.
+/// The reader's own loops use `parse_block_with`.
+pub fn parse_block(buf: &[u8]) -> Result<(Block, usize), CramError> {
+    parse_block_with(buf, &mut CodecScratch::default())
+}
+
+/// Parse a CRAM block, decoding with the caller's reusable scratch.
+pub(crate) fn parse_block_with(
+    buf: &[u8],
+    scratch: &mut CodecScratch,
+) -> Result<(Block, usize), CramError> {
+    let mut pos = 0;
+
+    let &method = buf.get(pos).ok_or_else(|| CramError::Truncated { context: "block method" })?;
+    pos = pos.checked_add(1).ok_or_else(|| CramError::Truncated { context: "block method pos" })?;
+
+    let &content_type_byte =
+        buf.get(pos).ok_or_else(|| CramError::Truncated { context: "block content type" })?;
+    let content_type = ContentType::from_byte(content_type_byte)?;
+    pos = pos
+        .checked_add(1)
+        .ok_or_else(|| CramError::Truncated { context: "block content type pos" })?;
+
+    let (content_id_u32, n) = varint::decode_itf8(
+        buf.get(pos..).ok_or_else(|| CramError::Truncated { context: "block content id" })?,
+    )
+    .ok_or_else(|| CramError::Truncated { context: "block content id" })?;
+    let content_id = content_id_u32.cast_signed();
+    pos = pos
+        .checked_add(n)
+        .ok_or_else(|| CramError::Truncated { context: "block content id pos" })?;
+
+    let (compressed_size, n) = varint::decode_itf8(
+        buf.get(pos..).ok_or_else(|| CramError::Truncated { context: "block compressed size" })?,
+    )
+    .ok_or_else(|| CramError::Truncated { context: "block compressed size" })?;
+    pos = pos
+        .checked_add(n)
+        .ok_or_else(|| CramError::Truncated { context: "block compressed size pos" })?;
+
+    let (uncompressed_size, n) = varint::decode_itf8(
+        buf.get(pos..)
+            .ok_or_else(|| CramError::Truncated { context: "block uncompressed size" })?,
+    )
+    .ok_or_else(|| CramError::Truncated { context: "block uncompressed size" })?;
+    pos = pos
+        .checked_add(n)
+        .ok_or_else(|| CramError::Truncated { context: "block uncompressed size pos" })?;
+
+    // CRC32 covers everything from the method byte through the end of compressed data
+    let crc_start = 0;
+
+    let compressed_end = pos
+        .checked_add(compressed_size as usize)
+        .ok_or_else(|| CramError::Truncated { context: "block compressed end overflow" })?;
+    let compressed_data = buf
+        .get(pos..compressed_end)
+        .ok_or_else(|| CramError::Truncated { context: "block data" })?;
+    pos = compressed_end;
+
+    // CRC32 is 4 bytes after the compressed data
+    let crc_end = pos
+        .checked_add(4)
+        .ok_or_else(|| CramError::Truncated { context: "block CRC32 pos overflow" })?;
+    let crc_bytes =
+        buf.get(pos..crc_end).ok_or_else(|| CramError::Truncated { context: "block CRC32" })?;
+    let expected_crc = u32::from_le_bytes(
+        crc_bytes.try_into().map_err(|_| CramError::Truncated { context: "block CRC32" })?,
+    );
+
+    // Verify CRC32 over [method .. compressed_data] (excludes the CRC32 itself)
+    let crc_data = buf
+        .get(crc_start..compressed_end)
+        .ok_or_else(|| CramError::Truncated { context: "block CRC32 range" })?;
+    let mut crc = libdeflater::Crc::new();
+    crc.update(crc_data);
+    if crc.sum() != expected_crc {
+        return Err(CramError::ChecksumMismatch {
+            context: "block",
+            expected: expected_crc,
+            found: crc.sum(),
+        });
+    }
+
+    pos = pos
+        .checked_add(4)
+        .ok_or_else(|| CramError::Truncated { context: "block pos after CRC" })?;
+
+    let uncompressed_size = uncompressed_size as usize;
+    super::reader::check_codec_output(uncompressed_size, "block uncompressed size")?;
+
+    // r[impl cram.block.decoded_size]
+    // htslib skips decoding a block that declares no data, whatever its method.
+    let data = if uncompressed_size == 0 {
+        Vec::new()
+    } else {
+        let data = decompress_block(
+            method,
+            compressed_data,
+            uncompressed_size,
+            content_type_byte,
+            content_id,
+            scratch,
+        )?;
+        check_decoded_size(method, uncompressed_size, data.len())?;
+        data
+    };
+
+    Ok((Block { content_type, content_id, data }, pos))
+}
+
+fn decompress_block(
+    method: u8,
+    compressed: &[u8],
+    uncompressed_size: usize,
+    content_type: u8,
+    content_id: i32,
+    scratch: &mut CodecScratch,
+) -> Result<Vec<u8>, CramError> {
+    match method {
+        // r[impl cram.codec.raw]
+        0 => Ok(compressed.to_vec()),
+        // r[impl cram.codec.gzip]
+        1 => {
+            let mut decompressor = libdeflater::Decompressor::new();
+            let mut output = vec![0u8; uncompressed_size];
+            let len = decompressor
+                .gzip_decompress(compressed, &mut output)
+                .map_err(|source| CramError::GzipDecompressionFailed { source })?;
+            output.truncate(len);
+            Ok(output)
+        }
+        // r[impl cram.codec.bzip2]
+        2 => {
+            // `uncompressed_size` passed `check_codec_output` above, so it is a
+            // bounded allocation; output shorter than it is fine.
+            scratch.bz2.decompress_to_vec(compressed, uncompressed_size).map_err(|source| {
+                match source {
+                    bz2ngrs::Error::OutputTooSmall { .. } => {
+                        CramError::BlockDecodesPastSize { method, expected: uncompressed_size }
+                    }
+                    _ => CramError::Bzip2DecompressionFailed { source },
+                }
+            })
+        }
+        // r[impl cram.codec.lzma]
+        3 => read_capped(xz2::read::XzDecoder::new(compressed), uncompressed_size)
+            .map_err(|source| CramError::LzmaDecompressionFailed { source }),
+        // r[impl cram.codec.rans4x8]
+        4 => super::rans::decode_with_buf(compressed, &mut scratch.rans_4x8),
+        // r[impl cram.codec.rans_nx16]
+        5 => super::rans_nx16::decode_with_buf(
+            compressed,
+            uncompressed_size,
+            &mut scratch.nx16_order1,
+        ),
+        // r[impl cram.codec.arith+2]
+        6 => super::arith::decode_with(compressed, uncompressed_size, scratch),
+        // r[impl cram.codec.fqzcomp]
+        7 => super::fqzcomp::decode(compressed),
+        // r[impl cram.codec.tok3]
+        8 => super::tok3::decode_with_scratch(compressed, scratch),
+        // r[impl cram.codec.unknown]
+        _ => Err(CramError::UnsupportedCodec { method, content_type, content_id }),
+    }
+}
+
+/// A streaming decoder's output, read to one byte past `size` at most, so
+/// a small stream cannot inflate past the header's length before
+/// [`check_decoded_size`] rejects it.
+fn read_capped(decoder: impl std::io::Read, size: usize) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let limit = u64::try_from(size).unwrap_or(u64::MAX).saturating_add(1);
+    let mut output = Vec::with_capacity(size);
+    decoder.take(limit).read_to_end(&mut output)?;
+    Ok(output)
+}
+
+// r[impl cram.block.decoded_size]
+/// The decoded length against the header's, as htslib checks it: bzip2
+/// output may fall short (htslib decodes into a buffer of the header's size
+/// and keeps what fits); every other method's must match exactly, except
+/// raw data, which is not decoded, and tok3, which stores its own length.
+fn check_decoded_size(method: u8, expected: usize, found: usize) -> Result<(), CramError> {
+    match method {
+        // Read to one byte past `expected` at most, so `found` says only that.
+        2 | 3 if found > expected => Err(CramError::BlockDecodesPastSize { method, expected }),
+        1 | 3..=7 if found != expected => {
+            Err(CramError::BlockSizeMismatch { method, expected, found })
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Build a raw CRAM block from components (for testing).
+#[cfg(test)]
+#[allow(clippy::cast_possible_truncation, reason = "test helper with known small values")]
+pub fn build_test_block(content_type: u8, content_id: i32, data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::new();
+
+    // method = 0 (raw)
+    buf.push(0);
+    // content type
+    buf.push(content_type);
+    // content_id as ITF8
+    encode_itf8_to(&mut buf, content_id as u32);
+    // compressed_size = uncompressed_size = data.len()
+    encode_itf8_to(&mut buf, data.len() as u32);
+    encode_itf8_to(&mut buf, data.len() as u32);
+    // data
+    buf.extend_from_slice(data);
+
+    // CRC32 over everything so far
+    let mut crc = libdeflater::Crc::new();
+    crc.update(&buf);
+    buf.extend_from_slice(&crc.sum().to_le_bytes());
+
+    buf
+}
+
+#[cfg(test)]
+fn encode_itf8_to(buf: &mut Vec<u8>, val: u32) {
+    let mut tmp = [0u8; 5];
+    let n = super::varint::encode_itf8(val, &mut tmp);
+    #[allow(clippy::indexing_slicing, reason = "n is the return value of encode_itf8, always ≤ 5")]
+    buf.extend_from_slice(&tmp[..n]);
+}
+
+#[cfg(test)]
+#[allow(clippy::cast_possible_truncation, reason = "test code with known small values")]
+mod tests {
+    use super::*;
+    use hegel::prelude::*;
+
+    // r[verify cram.block.structure]
+    // r[verify cram.codec.raw]
+    #[test]
+    fn parse_raw_block() {
+        let data = b"hello world";
+        let block_bytes = build_test_block(4, 0, data); // ExternalData, content_id=0
+        let (block, consumed) = parse_block(&block_bytes).unwrap();
+        assert_eq!(block.content_type, ContentType::ExternalData);
+        assert_eq!(block.content_id, 0);
+        assert_eq!(block.data, data);
+        assert_eq!(consumed, block_bytes.len());
+    }
+
+    #[test]
+    fn parse_raw_block_compression_header() {
+        let data = b"\x00\x00\x00"; // minimal
+        let block_bytes = build_test_block(1, 0, data);
+        let (block, _) = parse_block(&block_bytes).unwrap();
+        assert_eq!(block.content_type, ContentType::CompressionHeader);
+    }
+
+    #[test]
+    fn parse_raw_block_core_data() {
+        let data = b"\xFF\x00\xAA";
+        let block_bytes = build_test_block(5, 0, data);
+        let (block, _) = parse_block(&block_bytes).unwrap();
+        assert_eq!(block.content_type, ContentType::CoreData);
+        assert_eq!(block.data, data);
+    }
+
+    // r[verify cram.codec.gzip]
+    #[test]
+    fn parse_gzip_block() {
+        // Compress "hello" with gzip
+        let original = b"hello";
+        let mut compressor =
+            libdeflater::Compressor::new(libdeflater::CompressionLvl::new(6).unwrap());
+        let max_len = compressor.gzip_compress_bound(original.len());
+        let mut compressed = vec![0u8; max_len];
+        let actual_len = compressor.gzip_compress(original, &mut compressed).unwrap();
+        compressed.truncate(actual_len);
+
+        // Build a block with method=1 (gzip)
+        let mut buf = Vec::new();
+        buf.push(1); // method = gzip
+        buf.push(4); // content_type = ExternalData
+        encode_itf8_to(&mut buf, 7); // content_id = 7
+        encode_itf8_to(&mut buf, compressed.len() as u32);
+        encode_itf8_to(&mut buf, original.len() as u32);
+        buf.extend_from_slice(&compressed);
+
+        let mut crc = libdeflater::Crc::new();
+        crc.update(&buf);
+        buf.extend_from_slice(&crc.sum().to_le_bytes());
+
+        let (block, consumed) = parse_block(&buf).unwrap();
+        assert_eq!(block.content_type, ContentType::ExternalData);
+        assert_eq!(block.content_id, 7);
+        assert_eq!(block.data, original);
+        assert_eq!(consumed, buf.len());
+    }
+
+    // r[verify cram.codec.bzip2]
+    #[test]
+    fn parse_bzip2_block() {
+        use bzip2::write::BzEncoder;
+        use std::io::Write;
+
+        let original = b"hello bzip2 world, this is a test of bzip2 compression";
+        let mut encoder = BzEncoder::new(Vec::new(), bzip2::Compression::default());
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut buf = Vec::new();
+        buf.push(2); // method = bzip2
+        buf.push(4); // ExternalData
+        encode_itf8_to(&mut buf, 0);
+        encode_itf8_to(&mut buf, compressed.len() as u32);
+        encode_itf8_to(&mut buf, original.len() as u32);
+        buf.extend_from_slice(&compressed);
+        let mut crc = libdeflater::Crc::new();
+        crc.update(&buf);
+        buf.extend_from_slice(&crc.sum().to_le_bytes());
+
+        let (block, _) = parse_block(&buf).unwrap();
+        assert_eq!(block.data, original);
+    }
+
+    // r[verify cram.codec.arith+2]
+    #[test]
+    fn parse_arith_block() {
+        // The range-coded bytes of hts-specs' `range/q4.1` would do too; a
+        // CAT stream keeps the block's own framing the thing under test.
+        let original = b"arith";
+        let compressed = [0x20, 5, b'a', b'r', b'i', b't', b'h'];
+
+        let mut buf = Vec::new();
+        buf.push(6); // method = arith
+        buf.push(4); // ExternalData
+        encode_itf8_to(&mut buf, 0);
+        encode_itf8_to(&mut buf, compressed.len() as u32);
+        encode_itf8_to(&mut buf, original.len() as u32);
+        buf.extend_from_slice(&compressed);
+        let mut crc = libdeflater::Crc::new();
+        crc.update(&buf);
+        buf.extend_from_slice(&crc.sum().to_le_bytes());
+
+        let (block, _) = parse_block(&buf).unwrap();
+        assert_eq!(block.data, original);
+    }
+
+    // r[verify cram.codec.lzma]
+    #[test]
+    fn parse_lzma_block() {
+        use std::io::Write;
+
+        let original = b"hello lzma world, this is a test of lzma compression";
+        let mut encoder = xz2::write::XzEncoder::new(Vec::new(), 6);
+        encoder.write_all(original).unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let mut buf = Vec::new();
+        buf.push(3); // method = lzma
+        buf.push(4); // ExternalData
+        encode_itf8_to(&mut buf, 0);
+        encode_itf8_to(&mut buf, compressed.len() as u32);
+        encode_itf8_to(&mut buf, original.len() as u32);
+        buf.extend_from_slice(&compressed);
+        let mut crc = libdeflater::Crc::new();
+        crc.update(&buf);
+        buf.extend_from_slice(&crc.sum().to_le_bytes());
+
+        let (block, _) = parse_block(&buf).unwrap();
+        assert_eq!(block.data, original);
+    }
+
+    /// An external block of `method` holding `compressed`, whose header
+    /// says it decodes to `uncompressed_size` bytes.
+    fn method_block(method: u8, compressed: &[u8], uncompressed_size: usize) -> Vec<u8> {
+        let mut buf = vec![method, 4];
+        encode_itf8_to(&mut buf, 0);
+        encode_itf8_to(&mut buf, compressed.len() as u32);
+        encode_itf8_to(&mut buf, uncompressed_size as u32);
+        buf.extend_from_slice(compressed);
+        let mut crc = libdeflater::Crc::new();
+        crc.update(&buf);
+        buf.extend_from_slice(&crc.sum().to_le_bytes());
+        buf
+    }
+
+    // r[verify cram.block.decoded_size]
+    #[test]
+    fn decoded_length_must_match_the_header() {
+        let arith = [0x20, 5, b'a', b'r', b'i', b't', b'h'];
+        let err = parse_block(&method_block(6, &arith, 4)).unwrap_err();
+        assert!(
+            matches!(err, CramError::BlockSizeMismatch { method: 6, expected: 4, found: 5 }),
+            "{err:?}"
+        );
+
+        let mut compressor =
+            libdeflater::Compressor::new(libdeflater::CompressionLvl::new(6).unwrap());
+        let mut gzip = vec![0u8; compressor.gzip_compress_bound(5)];
+        let len = compressor.gzip_compress(b"hello", &mut gzip).unwrap();
+        gzip.truncate(len);
+        let err = parse_block(&method_block(1, &gzip, 6)).unwrap_err();
+        assert!(
+            matches!(err, CramError::BlockSizeMismatch { method: 1, expected: 6, found: 5 }),
+            "a short gzip stream is not padded with zeros: {err:?}"
+        );
+    }
+
+    // r[verify cram.block.decoded_size]
+    #[test]
+    fn streaming_decoders_stop_past_the_header_size() {
+        use std::io::Write;
+
+        // A MiB of zeros compresses to a few hundred bytes; a header
+        // claiming 100 bytes must not let them inflate.
+        let zeros = vec![0u8; 1 << 20];
+        let mut xz = xz2::write::XzEncoder::new(Vec::new(), 6);
+        xz.write_all(&zeros).unwrap();
+        let xz = xz.finish().unwrap();
+        let err = parse_block(&method_block(3, &xz, 100)).unwrap_err();
+        assert!(matches!(err, CramError::BlockDecodesPastSize { method: 3, expected: 100 }));
+
+        let mut bz = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+        bz.write_all(&zeros).unwrap();
+        let bz = bz.finish().unwrap();
+        let err = parse_block(&method_block(2, &bz, 100)).unwrap_err();
+        assert!(matches!(err, CramError::BlockDecodesPastSize { method: 2, expected: 100 }));
+
+        // bzip2 may come up short, as htslib allows; lzma may not.
+        let mut bz = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+        bz.write_all(b"short").unwrap();
+        let (block, _) = parse_block(&method_block(2, &bz.finish().unwrap(), 9)).unwrap();
+        assert_eq!(block.data, b"short");
+        let mut xz = xz2::write::XzEncoder::new(Vec::new(), 6);
+        xz.write_all(b"short").unwrap();
+        let err = parse_block(&method_block(3, &xz.finish().unwrap(), 9)).unwrap_err();
+        assert!(
+            matches!(err, CramError::BlockSizeMismatch { method: 3, expected: 9, found: 5 }),
+            "{err:?}"
+        );
+    }
+
+    // r[verify cram.block.decoded_size]
+    #[test]
+    fn a_block_of_no_bytes_is_not_decoded() {
+        // Not a valid arith stream, nor a gzip one; htslib never looks.
+        for method in [1, 6, 7, 8] {
+            let (block, _) = parse_block(&method_block(method, &[0xff, 0x01, 0x02], 0)).unwrap();
+            assert!(block.data.is_empty(), "method {method}");
+        }
+    }
+
+    // r[verify cram.block.crc32]
+    #[test]
+    fn crc32_mismatch_detected() {
+        let data = b"test";
+        let mut block_bytes = build_test_block(4, 0, data);
+        // Corrupt the last byte of CRC32
+        let len = block_bytes.len();
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "len is the length of the vec just created above"
+        )]
+        {
+            block_bytes[len - 1] ^= 0xFF;
+        }
+        let err = parse_block(&block_bytes).unwrap_err();
+        assert!(matches!(err, CramError::ChecksumMismatch { .. }));
+    }
+
+    // r[verify cram.codec.unknown]
+    #[test]
+    fn unsupported_codec_detected() {
+        let mut buf = Vec::new();
+        buf.push(200); // method = 200 (not defined)
+        buf.push(4); // ExternalData
+        encode_itf8_to(&mut buf, 0);
+        encode_itf8_to(&mut buf, 0); // compressed size = 0
+        // Not 0: a block of no bytes is never decoded.
+        encode_itf8_to(&mut buf, 1); // uncompressed size = 1
+
+        let mut crc = libdeflater::Crc::new();
+        crc.update(&buf);
+        buf.extend_from_slice(&crc.sum().to_le_bytes());
+
+        let err = parse_block(&buf).unwrap_err();
+        match err {
+            CramError::UnsupportedCodec { method, .. } => assert_eq!(method, 200),
+            other => panic!("expected UnsupportedCodec, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_block() {
+        assert!(parse_block(&[]).is_err());
+        assert!(parse_block(&[0]).is_err());
+        assert!(parse_block(&[0, 4]).is_err());
+    }
+
+    #[test]
+    fn multiple_blocks_sequential() {
+        let block1 = build_test_block(4, 1, b"first");
+        let block2 = build_test_block(4, 2, b"second");
+        let mut combined = block1.clone();
+        combined.extend_from_slice(&block2);
+
+        let (b1, consumed1) = parse_block(&combined).unwrap();
+        assert_eq!(b1.content_id, 1);
+        assert_eq!(b1.data, b"first");
+
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "consumed1 is a valid byte offset returned by parse_block"
+        )]
+        let (b2, consumed2) = parse_block(&combined[consumed1..]).unwrap();
+        assert_eq!(b2.content_id, 2);
+        assert_eq!(b2.data, b"second");
+        assert_eq!(consumed1 + consumed2, combined.len());
+    }
+
+    #[test]
+    fn unknown_content_type_returns_error() {
+        let err = ContentType::from_byte(255).unwrap_err();
+        assert!(matches!(err, CramError::UnknownBlockContentType { content_type: 255 }));
+    }
+
+    #[test]
+    fn unknown_content_type_invalid_values() {
+        // Only 0, 1, 2, 4, 5 are valid — test a selection of invalid ones
+        for invalid in [3u8, 6, 100, 200] {
+            let err = ContentType::from_byte(invalid).unwrap_err();
+            assert!(
+                matches!(err, CramError::UnknownBlockContentType { content_type: b } if b == invalid),
+                "expected UnknownBlockContentType for {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn gzip_decompression_failed_on_garbage() {
+        // Build a block with method=1 (gzip) but garbage compressed data
+        let garbage = [0xFFu8; 10];
+        let mut buf = Vec::new();
+        buf.push(1u8); // method = gzip
+        buf.push(4u8); // ExternalData
+        encode_itf8_to(&mut buf, 0);
+        encode_itf8_to(&mut buf, garbage.len() as u32);
+        encode_itf8_to(&mut buf, 100u32); // claim 100 bytes uncompressed
+        buf.extend_from_slice(&garbage);
+        let mut crc = libdeflater::Crc::new();
+        crc.update(&buf);
+        buf.extend_from_slice(&crc.sum().to_le_bytes());
+
+        let err = parse_block(&buf).unwrap_err();
+        assert!(matches!(err, CramError::GzipDecompressionFailed { .. }));
+    }
+
+    #[test]
+    fn bzip2_decompression_failed_on_garbage() {
+        let garbage = [0xFFu8; 10];
+        let mut buf = Vec::new();
+        buf.push(2u8); // method = bzip2
+        buf.push(4u8); // ExternalData
+        encode_itf8_to(&mut buf, 0);
+        encode_itf8_to(&mut buf, garbage.len() as u32);
+        encode_itf8_to(&mut buf, 100u32);
+        buf.extend_from_slice(&garbage);
+        let mut crc = libdeflater::Crc::new();
+        crc.update(&buf);
+        buf.extend_from_slice(&crc.sum().to_le_bytes());
+
+        let err = parse_block(&buf).unwrap_err();
+        assert!(matches!(err, CramError::Bzip2DecompressionFailed { .. }));
+        // The decoder's context (here: not a bzip2 stream) is reachable through `source()`.
+        let source = std::error::Error::source(&err).expect("bzip2 failure carries its source");
+        assert!(source.to_string().contains("not a bzip2 stream"), "{source}");
+    }
+
+    // r[verify cram.codec.scratch]
+    #[test]
+    fn one_scratch_decodes_bzip2_blocks_after_a_failed_one() {
+        use std::io::Write;
+        let mut bz = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+        bz.write_all(&b"hello bzip2 ".repeat(50)).unwrap();
+        let good = bz.finish().unwrap();
+        let mut bad = good.clone();
+        bad[10] ^= 1;
+
+        let mut scratch = CodecScratch::default();
+        let want = b"hello bzip2 ".repeat(50);
+        for stream in [&good, &bad, &good] {
+            let result = parse_block_with(&method_block(2, stream, 600), &mut scratch);
+            if std::ptr::eq(stream, &bad) {
+                assert!(matches!(result, Err(CramError::Bzip2DecompressionFailed { .. })));
+            } else {
+                assert_eq!(result.unwrap().0.data, want);
+            }
+        }
+    }
+
+    #[test]
+    fn bzip2_corruption_reports_block_and_bit() {
+        use std::io::Write;
+        let mut bz = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+        bz.write_all(&b"hello bzip2 ".repeat(50)).unwrap();
+        let mut stream = bz.finish().unwrap();
+        // Flip a bit in the stored block CRC (bytes 10..14: after "BZh1" and the 48-bit block magic).
+        stream[10] ^= 1;
+        let err = parse_block(&method_block(2, &stream, 600)).unwrap_err();
+        let CramError::Bzip2DecompressionFailed { source } = &err else {
+            panic!("expected Bzip2DecompressionFailed, got {err:?}");
+        };
+        assert!(matches!(source, bz2ngrs::Error::BlockCrc { block: 0, .. }), "{source:?}");
+        let chain = std::error::Error::source(&err).unwrap().to_string();
+        assert!(chain.contains("block 0 CRC mismatch"), "{chain}");
+    }
+
+    #[test]
+    fn lzma_decompression_failed_on_garbage() {
+        let garbage = [0xFFu8; 10];
+        let mut buf = Vec::new();
+        buf.push(3u8); // method = lzma
+        buf.push(4u8); // ExternalData
+        encode_itf8_to(&mut buf, 0);
+        encode_itf8_to(&mut buf, garbage.len() as u32);
+        encode_itf8_to(&mut buf, 100u32);
+        buf.extend_from_slice(&garbage);
+        let mut crc = libdeflater::Crc::new();
+        crc.update(&buf);
+        buf.extend_from_slice(&crc.sum().to_le_bytes());
+
+        let err = parse_block(&buf).unwrap_err();
+        assert!(matches!(err, CramError::LzmaDecompressionFailed { .. }));
+    }
+
+    #[test]
+    fn expected_compression_header_wrong_content_type() {
+        // Build a raw block with content type = CoreData (5), then check it
+        // where CompressionHeader (1) is expected.
+        // We simulate this by checking what parse_block returns vs the expected type.
+        let data = b"\x00\x01\x02";
+        // Block with ExternalData (4) but we want to detect it's not CompressionHeader (1)
+        let block_bytes = build_test_block(4, 0, data); // 4 = ExternalData
+        let (block, _) = parse_block(&block_bytes).unwrap();
+        // Check that the content type mismatch would produce the right error
+        assert_eq!(block.content_type, ContentType::ExternalData);
+        let err = CramError::ExpectedCompressionHeader { found: block.content_type };
+        assert!(matches!(
+            err,
+            CramError::ExpectedCompressionHeader { found: ContentType::ExternalData }
+        ));
+    }
+
+    #[test]
+    fn expected_file_header_wrong_content_type() {
+        let data = b"\x00\x01\x02";
+        let block_bytes = build_test_block(5, 0, data); // 5 = CoreData
+        let (block, _) = parse_block(&block_bytes).unwrap();
+        assert_eq!(block.content_type, ContentType::CoreData);
+        let err = CramError::ExpectedFileHeader { found: block.content_type };
+        assert!(matches!(err, CramError::ExpectedFileHeader { found: ContentType::CoreData }));
+    }
+
+    // Construct a raw block at the byte level according to the CRAM spec:
+    // method(1) | content_type(1) | content_id(ITF8) | compressed_size(ITF8)
+    // | uncompressed_size(ITF8) | data | CRC32(4 LE)
+    // Parse it with parse_block and assert every field matches what was written.
+    #[test]
+    fn raw_block_from_known_bytes() {
+        // ExternalData (4), content_id=7, data="hello"
+        let payload = b"hello";
+        let size = payload.len() as u32; // 5 — encodes as single ITF8 byte
+
+        let mut buf = Vec::new();
+        buf.push(0u8); // method = raw
+        buf.push(4u8); // content_type = ExternalData
+        encode_itf8_to(&mut buf, 7); // content_id ITF8: 7 → [0x07]
+        encode_itf8_to(&mut buf, size); // compressed_size ITF8: 5 → [0x05]
+        encode_itf8_to(&mut buf, size); // uncompressed_size ITF8: 5 → [0x05]
+        buf.extend_from_slice(payload);
+        let mut crc = libdeflater::Crc::new();
+        crc.update(&buf);
+        buf.extend_from_slice(&crc.sum().to_le_bytes());
+
+        // Verify hand-crafted header bytes before parsing
+        assert_eq!(buf.first(), Some(&0u8), "method byte must be 0 (raw)");
+        assert_eq!(buf.get(1), Some(&4u8), "content_type byte must be 4 (ExternalData)");
+        assert_eq!(buf.get(2), Some(&7u8), "content_id ITF8: single byte for val < 0x80");
+        assert_eq!(buf.get(3), Some(&5u8), "compressed_size ITF8: single byte for val < 0x80");
+        assert_eq!(buf.get(4), Some(&5u8), "uncompressed_size ITF8: single byte for val < 0x80");
+
+        let (block, consumed) = parse_block(&buf).unwrap();
+        assert_eq!(block.content_type, ContentType::ExternalData);
+        assert_eq!(block.content_id, 7);
+        assert_eq!(block.data, payload);
+        assert_eq!(consumed, buf.len());
+
+        // Also verify a 2-byte ITF8 content_id (val=128 → [0x80, 0x80])
+        let mut buf2 = Vec::new();
+        buf2.push(0u8); // raw
+        buf2.push(4u8); // ExternalData
+        encode_itf8_to(&mut buf2, 128); // content_id = 128 → 2 ITF8 bytes: [0x80, 0x80]
+        encode_itf8_to(&mut buf2, 3u32);
+        encode_itf8_to(&mut buf2, 3u32);
+        buf2.extend_from_slice(b"abc");
+        let mut crc2 = libdeflater::Crc::new();
+        crc2.update(&buf2);
+        buf2.extend_from_slice(&crc2.sum().to_le_bytes());
+
+        assert_eq!(buf2.get(2), Some(&0x80u8), "first ITF8 byte for 128: 0x80");
+        assert_eq!(buf2.get(3), Some(&0x80u8), "second ITF8 byte for 128: 0x80");
+
+        let (block2, consumed2) = parse_block(&buf2).unwrap();
+        assert_eq!(block2.content_id, 128);
+        assert_eq!(block2.data, b"abc");
+        assert_eq!(consumed2, buf2.len());
+    }
+
+    #[hegel::test]
+    fn gzip_block_roundtrip(tc: TestCase) {
+        let data = tc.draw(gs::binary().min_size(1).max_size(255));
+        let mut compressor =
+            libdeflater::Compressor::new(libdeflater::CompressionLvl::new(1).unwrap());
+        let max_len = compressor.gzip_compress_bound(data.len());
+        let mut compressed = vec![0u8; max_len];
+        let actual_len = compressor.gzip_compress(&data, &mut compressed).unwrap();
+        compressed.truncate(actual_len);
+
+        let mut buf = Vec::new();
+        buf.push(1); // gzip
+        buf.push(4); // ExternalData
+        encode_itf8_to(&mut buf, 0);
+        encode_itf8_to(&mut buf, compressed.len() as u32);
+        encode_itf8_to(&mut buf, data.len() as u32);
+        buf.extend_from_slice(&compressed);
+        let mut crc = libdeflater::Crc::new();
+        crc.update(&buf);
+        buf.extend_from_slice(&crc.sum().to_le_bytes());
+
+        let (block, _) = parse_block(&buf).unwrap();
+        assert_eq!(&block.data, &data);
+    }
+
+    #[test]
+    fn parse_block_from_real_cram() {
+        // Read the header container's first block from our test CRAM file
+        let data =
+            std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../../tests/data/test.cram"))
+                .unwrap();
+
+        // Skip 26-byte file definition
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "CRAM file definition is always 26 bytes per spec"
+        )]
+        let after_file_def = &data[26..];
+
+        // Skip the container header (variable length) to get to the first block
+        // Container header starts with i32 length
+        let container_length = i32::from_le_bytes([
+            after_file_def[0],
+            after_file_def[1],
+            after_file_def[2],
+            after_file_def[3],
+        ]);
+        assert!(container_length > 0, "header container should have positive length");
+
+        // Parse ITF8 fields to find where the container header ends
+        // We need to skip: i32(length) + itf8(ref_seq_id) + itf8(alignment_start)
+        //   + itf8(alignment_span) + itf8(num_records) + ltf8(record_counter)
+        //   + ltf8(bases) + itf8(num_blocks) + itf8_array(landmarks) + 4(crc32)
+        // For the file header container these are mostly zeros, so ITF8 = 1 byte each
+        //
+        // Instead of parsing the full header, just try to find and parse the block
+        // by scanning for valid block structures. The header container's block should
+        // be a file header block (content_type=0) with the SAM header text.
+        //
+        // This is a smoke test — we'll do proper container parsing in step 4.
+    }
+}
