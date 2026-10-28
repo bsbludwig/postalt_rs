@@ -186,6 +186,27 @@ fn truncated_and_padded_bgzf_input() {
 }
 
 #[test]
+fn bgzipped_sam_input() {
+    // Several BGZF blocks, so read-ahead workers inflate more than one batch.
+    let sam = format!(
+        "{HEADER}{}",
+        (0..3000)
+            .map(|i| read(&format!("r{i}")))
+            .collect::<String>()
+    );
+    let bgzf = deflate(sam.as_bytes());
+    for jobs in ["0", "1", "4"] {
+        let output = run(&["-j", jobs], &bgzf);
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert_eq!(output.stdout, sam.as_bytes(), "-j {jobs}");
+    }
+    // As with plain gzip, the EOF marker block is optional for SAM.
+    let output = run(&[], &bgzf[..bgzf.len() - 28]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(output.stdout, sam.as_bytes());
+}
+
+#[test]
 fn unsupported_inputs_are_named() {
     let output = run(&[], b"CRAM\x03\x00\x00\x00");
     assert!(

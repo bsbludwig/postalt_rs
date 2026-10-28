@@ -21,7 +21,7 @@ use anyhow::{Context, Result, bail};
 use seqair::{
     bam::{
         BamHeader, RawBamRecord,
-        bgzf::BgzfStream,
+        bgzf::{BgzfStream, EofMarker},
         stream::BamStreamReader,
         writer::{BamWriter, BamWriterBuilder},
     },
@@ -135,6 +135,9 @@ fn group_key(format: Format, record: &[u8]) -> Option<(&[u8], u16)> {
 
 /// Buffered file/stdin/replayed stream shared by both input formats.
 type InputStream = BufReader<Box<dyn Read + Send>>;
+/// SAM text: plain or gzip text behind a [`BufReader`], or a [`BgzfStream`],
+/// which buffers its own inflated blocks.
+type TextStream = Box<dyn BufRead + Send>;
 
 /// Alignment input whose header has already been consumed.
 ///
@@ -160,7 +163,7 @@ enum Source {
     /// Plain or decompressed SAM text, with original leading header lines.
     Sam {
         /// Buffered text after any format-detection replay/decompression.
-        reader: InputStream,
+        reader: TextStream,
         /// First nonheader line read during header detection, if any.
         pending: Option<Vec<u8>>,
         /// Leading header text with line endings normalized to LF.
@@ -181,9 +184,9 @@ enum Source {
 impl Input {
     /// Open a path, or stdin when `path` is `None` or `-`, and read its header.
     ///
-    /// BAM input is inflated on rayon's global pool, up to `threads` batches of
-    /// blocks at once (zero inflates on the reading thread); SAM input ignores
-    /// it.
+    /// BAM and bgzipped SAM are inflated on rayon's global pool, up to `threads`
+    /// batches of blocks at once (zero inflates on the reading thread); plain
+    /// and (non-BGZF) gzip SAM ignore it.
     ///
     /// # Errors
     /// Returns open errors or the detection/header errors of [`Self::from_reader`].
@@ -219,6 +222,7 @@ impl Input {
         let reader: Box<dyn Read + Send> = Box::new(io::Cursor::new(prefix).chain(reader));
         let mut reader = BufReader::with_capacity(256 * 1024, reader);
         let mut is_bam = false;
+        let mut is_bgzf = false;
         if gzip {
             // Inspect decompressed magic without assuming a seekable stream or
             // relying on the filename. Replay consumed compressed bytes to seqair.
@@ -229,25 +233,30 @@ impl Input {
             };
             let magic = read_prefix(&mut flate2::read::MultiGzDecoder::new(&mut tee), 4)?;
             is_bam = magic == b"BAM\x01";
+            // htslib's BGZF test: FEXTRA set and a `BC` first subfield.
+            is_bgzf = consumed.get(3).is_some_and(|flags| flags & 4 != 0)
+                && consumed.get(12..16) == Some(b"BC\x02\x00");
             let replay = io::Cursor::new(consumed).chain(reader);
-            let source: Box<dyn Read + Send> = if is_bam {
+            let source: Box<dyn Read + Send> = if is_bam || is_bgzf {
                 Box::new(replay)
             } else {
                 Box::new(flate2::read::MultiGzDecoder::new(replay))
             };
             reader = BufReader::with_capacity(256 * 1024, source);
         }
-        let mut number = 0;
-        let source = if is_bam {
-            // Decompression shares rayon's global pool; `threads` bounds how
-            // many batches it inflates at once (255 at most).
+        // Decompression shares rayon's global pool; `threads` bounds how many
+        // batches it inflates at once (255 at most).
+        let bgzf = |reader| {
             let builder = BgzfStream::builder(reader);
-            let stream = match NonZeroU8::new(u8::try_from(threads).unwrap_or(u8::MAX)) {
+            match NonZeroU8::new(u8::try_from(threads).unwrap_or(u8::MAX)) {
                 Some(n) => builder.threads(n),
                 None => builder,
             }
-            .build();
-            let reader = BamStreamReader::from_bgzf(stream).context("read BAM header")?;
+        };
+        let mut number = 0;
+        let source = if is_bam {
+            let reader =
+                BamStreamReader::from_bgzf(bgzf(reader).build()).context("read BAM header")?;
             let header = Arc::new(reader.header().clone());
             let mut text = Vec::new();
             format::format_sam_header(&header, &mut text).context("BAM header text")?;
@@ -257,6 +266,14 @@ impl Input {
                 text,
             }
         } else {
+            // Bgzipped SAM inflates in parallel, unlike plain gzip. The EOF
+            // marker stays optional, as it was when every gzip SAM went
+            // through `MultiGzDecoder`.
+            let mut reader: TextStream = if is_bgzf {
+                Box::new(bgzf(reader).eof_marker(EofMarker::Optional).build())
+            } else {
+                Box::new(reader)
+            };
             let mut header = Vec::new();
             let mut line = Vec::new();
             loop {

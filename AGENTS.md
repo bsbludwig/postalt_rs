@@ -77,6 +77,8 @@ Current user instructions take precedence over remembered instructions.
 
 ### Standing user instructions and decisions
 - Do not commit to git on the user's behalf. Do not run any mutating git commands, unless explicitly told to do so.
+- For open-ended work (e.g. "optimize X"), investigate first, then describe the
+  proposed changes and wait for the user's go-ahead before editing code.
 - Use **seqair** for production BAM/SAM parsing and writing. Performance and
   comprehensive compatibility testing against `bwa-postalt.js` are priorities.
 - Add proper Rust doc comments, Python docstrings, and explanatory comments
@@ -120,7 +122,8 @@ Current user instructions take precedence over remembered instructions.
 - Seqair's `compression_threads(0)` is synchronous; positive values create
   that many compression workers. The application CLI currently requires at
   least one worker. `-@` sets BAM compression workers only; `-j` sets
-  processing and BAM decompression workers (`-j 0`: single thread).
+  processing and BGZF (BAM, bgzipped SAM) decompression workers (`-j 0`:
+  single thread). Plain gzip SAM stays single-threaded `flate2`.
 - Output must be byte-identical for every `-j`. Within a batch, a group's
   output is only written once sequential processing would have flushed it
   (next record parsed, or clean EOF); keep that rule when changing errors.
@@ -182,3 +185,13 @@ bridge's extra conversions between htslib records and the core's SAM text
 fields. They do not measure rust-htslib or a core operating directly on htslib
 records, and do not establish a universal htslib slowdown. The two-worker BAM
 advantage is elapsed time, not lower total CPU time. Production still uses seqair.
+
+Streaming-reader tuning (2026-10-28, M4 Pro laptop, warm cache, `/dev/null`;
+local data: NA12878 TAPS chr12:100-115 Mb, 3.24M records, 3.5% XA, prepared
+under ignored `target/bench/pt/`). Bgzipped SAM now uses seqair's threaded
+`BgzfStream` (2.18 -> 0.21 s at `-j 8`). Seqair branch
+`perf/aux-find-and-sam-format` (worktree `../seqair-aux-perf`) walks aux tags in
+one fearless_simd kernel for `find_tag` and SAM formatting: BAM->SAM `-j 1`
+1.11 -> 0.97 s. BAM output is compression-bound (seqair uses less CPU than
+samtools at level 6); plain gzip is single-threaded flate2 (libdeflate has no
+streaming API).

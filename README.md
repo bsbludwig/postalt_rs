@@ -27,13 +27,13 @@ bwa-mem2 mem reference.fa reads_1.fq.gz reads_2.fq.gz \
 ./target/release/postalt_rs -p hla_reads -r 0.8 reference.fa.alt alignments.sam > adjusted.sam
 ```
 
-Input is detected by content: SAM, gzip/BGZF SAM, or BGZF BAM, from a file or pipe. The ALT mapping file may also be gzip-compressed. Output is SAM by default; `-O bam` selects BAM independently of the filename. BAM output needs an `@SQ` dictionary containing every emitted reference. Headerless SAM remains supported for SAM output. CRAM and uncompressed BAM are recognised and refused with an error.
+Input is detected by content: SAM, gzip/BGZF SAM, or BGZF BAM, from a file or pipe. Bgzipped SAM is inflated on the `-j` workers like BAM; plain (non-BGZF) gzip is decoded on one thread, since its members cannot be split. The ALT mapping file may also be gzip-compressed. Output is SAM by default; `-O bam` selects BAM independently of the filename. BAM output needs an `@SQ` dictionary containing every emitted reference. Headerless SAM remains supported for SAM output. CRAM and uncompressed BAM are recognised and refused with an error.
 
 BAM input must be complete: a BAM that ends without its BGZF end-of-file marker (a truncated file, or a pipe whose producer died) is an error after the records before it have been processed, where samtools only warns. Empty BGZF blocks in the middle of a file are skipped, as htslib skips them. A BAM header is printed as `samtools view -h` prints it: cut at its first NUL and newline-terminated.
 
 **Keep all records for each read name and read end contiguous, in aligner order.** Sorting only by read name can interleave mates. Primary records must precede the ALT records that adjust them. Coordinate-sorted input is unsuitable. Output order and headers are preserved as in the script; output is not coordinate-sorted, even if an input header claims otherwise. Sort the output before indexing it.
 
-Read-end groups are independent, so input is read in batches of whole groups (about 512 KiB each). With `-j N`, one thread reads, `N` threads process batches and decompress BAM input, and the main thread writes results in input order; output is byte-identical for every `-j`. At most `2N + 2` batches are in flight, so memory stays bounded apart from unusually large groups: peak RSS was about 30 MiB with `-j 0` or `-j 1` and up to about 140 MiB with `-j 8` on the validation data. `-j 0` runs everything on one thread, holding one batch at a time. Records that cannot involve an ALT contig (unmapped, or no `XA` tag and not on an ALT contig or, with `-p`, the HLA chromosome) skip hit parsing, as they would pass through the script unchanged. BAM input records stay in wire form unless they need to change: BAM output copies them verbatim when its header is the input's own.
+Read-end groups are independent, so input is read in batches of whole groups (about 512 KiB each). With `-j N`, one thread reads, `N` threads process batches and decompress BAM or bgzipped SAM input, and the main thread writes results in input order; output is byte-identical for every `-j`. At most `2N + 2` batches are in flight, so memory stays bounded apart from unusually large groups: peak RSS was about 30 MiB with `-j 0` or `-j 1` and up to about 140 MiB with `-j 8` on the validation data. `-j 0` runs everything on one thread, holding one batch at a time. Records that cannot involve an ALT contig (unmapped, or no `XA` tag and not on an ALT contig or, with `-p`, the HLA chromosome) skip hit parsing, as they would pass through the script unchanged. BAM input records stay in wire form unless they need to change: BAM output copies them verbatim when its header is the input's own.
 
 | Option | Meaning |
 | --- | --- |
@@ -44,7 +44,7 @@ Read-end groups are independent, so input is read in batches of whole groups (ab
 | `-o FILE` | Output file; default stdout, `-` explicitly selects stdout |
 | `-O sam\|bam` | Output format; default SAM |
 | `-@ INT` | BAM compression workers; default 1 |
-| `-j, --jobs INT` | Processing and BAM decompression workers; default 1; `0` runs on one thread |
+| `-j, --jobs INT` | Processing and BGZF (BAM, bgzipped SAM) decompression workers; default 1; `0` runs on one thread |
 | `--compression INT` | BAM compression level 0–12; default 6 |
 | `--k8-1.2-compat` | Leave generated opposite-strand sequence and quality unchanged |
 

@@ -34,7 +34,7 @@ Input defaults to stdin; output defaults to SAM on stdout.\n\n\
   -o, --output FILE      Output path (- for stdout)\n\
   -O, --output-format F  sam or bam (default sam)\n\
   -@, --threads INT      BAM compression workers (default 1)\n\
-  -j, --jobs INT         Processing and BAM decompression workers (default 1;\n\
+  -j, --jobs INT         Processing and BGZF decompression workers (default 1;\n\
                          0 runs everything on one thread)\n\
   --k8-1.2-compat        Reproduce installed k8's unchanged reverse sequences\n\
   --compression INT     BAM compression level 0..12 (default 6)\n\
