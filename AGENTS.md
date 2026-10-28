@@ -14,8 +14,9 @@ This repository implements a streaming Rust replacement for BWA/bwakit's
   adjustment, supplementary records, HLA FASTQ text, pass-through fast path.
 - `src/io.rs`: SAM/gzip/BAM stream detection, batch framing, `Record`
   (SAM text or BAM wire form), serialization, and output.
-- `vendor/seqair/`: pinned alignment parser/writer and local streaming adapter.
-  Read `vendor/seqair/POSTALT_PATCHES.md` before modifying or updating it.
+- `src/sam_text.rs`: text-preserving SAM line (`SamRecord`) for byte-exact SAM
+  output. BAM framing, SAM↔BAM conversion and BGZF come from the seqair crate.
+- `tests/robustness.rs`: malformed/adversarial input; needs only `tests/fixtures/alt.sam`.
 - `tests/compatibility.rs`: reference-derived golden cases and I/O regression tests.
 - `scripts/compatibility.py`: live k8 differential tests and fixture generation.
 - `scripts/prepare_real_data.py`, `validate_real.py`, `benchmark.py`: real-data
@@ -86,7 +87,7 @@ Current user instructions take precedence over remembered instructions.
   reproduce the installed runtime's unchanged sequence/quality output.
 - The script is from **BWA/bwakit**, despite being installed with BWA-MEM2.
   The port uses **GPL-3.0-only**, not the Intel/BWA-MEM2 MIT license. Preserve
-  `LICENSE`, `NOTICE.md`, and vendored seqair's upstream MIT/Apache-2.0 notices.
+  `LICENSE` and `NOTICE.md`.
 - The htslib comparison was an experiment, not a request to change the
   production backend.
 

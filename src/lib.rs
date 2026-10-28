@@ -44,3 +44,4 @@
 pub mod io;
 pub mod pipeline;
 pub mod postalt;
+pub mod sam_text;

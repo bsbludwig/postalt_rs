@@ -164,7 +164,7 @@ fn sam_stdin_and_explicit_stdout() {
 
 #[test]
 fn bam_output_and_stream_input_preserve_records_and_aux_types() {
-    use seqair::sam::stream::SamRecord;
+    use postalt_rs::sam_text::SamRecord;
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("input.bam");
     let source = fs::read_to_string(fixture("same_locus/input.sam")).unwrap();
@@ -185,13 +185,13 @@ fn bam_output_and_stream_input_preserve_records_and_aux_types() {
     .map(|line| SamRecord::parse(line.as_bytes()).unwrap())
     .collect();
     for threads in [1, 2] {
-        let mut out = Output::create(Some(&path), true, &header, threads, 6).unwrap();
+        let mut out = Output::create(Some(&path), true, header.as_bytes(), threads, 6).unwrap();
         for r in &records {
             out.write(r).unwrap();
         }
         out.finish().unwrap();
         let mut input = Input::open(Some(&path), threads - 1).unwrap();
-        assert_eq!(input.header_text(), header);
+        assert_eq!(input.header_text(), header.as_bytes());
         for original in &records {
             let actual = input.next_record().unwrap().unwrap();
             let mut a = Vec::new();
@@ -257,7 +257,7 @@ fn bam_matches_sam_on_alt_processing() {
                 String::from_utf8_lossy(&output.stderr)
             );
             let mut input = Input::open(Some(&result), 0).unwrap();
-            let mut actual = input.header_text().as_bytes().to_vec();
+            let mut actual = input.header_text().to_vec();
             while let Some(r) = input.next_record().unwrap() {
                 r.write_sam(&mut actual).unwrap();
             }
@@ -515,7 +515,7 @@ fn many_batches_match_golden_output_for_every_job_count() {
     };
     let decode = |from: &std::path::Path| {
         let mut reader = Input::open(Some(from), 2).unwrap();
-        let mut text = reader.header_text().as_bytes().to_vec();
+        let mut text = reader.header_text().to_vec();
         while let Some(r) = reader.next_record().unwrap() {
             r.write_sam(&mut text).unwrap();
         }
