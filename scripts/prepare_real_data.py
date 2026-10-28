@@ -3,7 +3,8 @@
 # Part of postalt_rs; see NOTICE.md for BWA/bwakit provenance.
 """Extract indexed ALT + MHC reads; restore contiguous read-end groups.
 
-Requires samtools. Sorting cannot reconstruct the aligner's exact original order;
+--regions replaces the default ALT + MHC selection, e.g. a primary-only region
+for a pass-through-heavy benchmark. Requires samtools. Sorting cannot reconstruct the aligner's exact original order;
 within each read end, original primary records precede secondary/supplementary.
 No clinical reads are checked into the repository.
 """
@@ -15,13 +16,17 @@ import subprocess
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('bam')
 p.add_argument('directory', type=Path)
+p.add_argument('--regions', nargs='+', help='samtools regions to extract instead of ALT + MHC')
 a = p.parse_args()
 a.directory.mkdir(parents=True, exist_ok=True)
-stats = subprocess.check_output(['samtools', 'idxstats', a.bam], text=True)
-# Select regional alignments, not all distant records with a selected QNAME.
-# Include a primary MHC region so earlier primary/ALT interactions are exercised.
-regions = [l.split('\t')[0] for l in stats.splitlines() if '_alt\t' in l]
-regions += ['chr6:30000000-31000000']
+if a.regions:
+    regions = a.regions
+else:
+    stats = subprocess.check_output(['samtools', 'idxstats', a.bam], text=True)
+    # Select regional alignments, not all distant records with a selected QNAME.
+    # Include a primary MHC region so earlier primary/ALT interactions are exercised.
+    regions = [l.split('\t')[0] for l in stats.splitlines() if '_alt\t' in l]
+    regions += ['chr6:30000000-31000000']
 extract = subprocess.Popen(['samtools', 'view', '--no-PG', '-u', a.bam, *regions], stdout=subprocess.PIPE)
 subprocess.run(['samtools', 'sort', '--no-PG', '-n', '-@', '2', '-m', '512M', '-o', str(a.directory/'names.bam'), '-'], stdin=extract.stdout, check=True)
 extract.stdout.close()

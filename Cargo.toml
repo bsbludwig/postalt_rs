@@ -10,6 +10,10 @@ description = "Streaming, bwa-postalt.js r985 compatible ALT alignment postproce
 seqair = { path = "vendor/seqair/crates/seqair" }
 anyhow = "1"
 flate2 = "1"
+itoa = "1"
+memchr = "2"
+mimalloc = { version = "0.1", default-features = false }
+rustc-hash = "2"
 
 [dev-dependencies]
 tempfile = "3"

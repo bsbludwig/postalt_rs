@@ -1,0 +1,300 @@
+{
+ "date": "2026-10-28",
+ "host": "AMD EPYC 9555P (64 cores), Linux x86-64, warm cache, stdout to /dev/null, median of 3",
+ "old": "postalt_rs before the optimization (thin LTO release, glibc malloc, single-threaded processing)",
+ "new": "postalt_rs after the optimization (mimalloc, batch pipeline)",
+ "datasets": {
+  "passthrough": "chr1:100000000-115000000, 2,893,003 records, 1.98 GB SAM",
+  "real": "261 ALT contigs + chr6:30-31 Mb, 1,042,930 records, 0.91 GB SAM"
+ },
+ "rows": [
+  {
+   "dataset": "passthrough",
+   "path": "SAM\u2192SAM",
+   "impl": "old",
+   "wall": 2.91,
+   "user": 2.69,
+   "sys": 0.21,
+   "rss_mib": 6.0
+  },
+  {
+   "dataset": "passthrough",
+   "path": "SAM\u2192SAM",
+   "impl": "new -j 0",
+   "wall": 1.16,
+   "user": 0.93,
+   "sys": 0.21,
+   "rss_mib": 28.796875
+  },
+  {
+   "dataset": "passthrough",
+   "path": "SAM\u2192SAM",
+   "impl": "new -j 1 (default)",
+   "wall": 0.83,
+   "user": 0.97,
+   "sys": 0.24,
+   "rss_mib": 34.8203125
+  },
+  {
+   "dataset": "passthrough",
+   "path": "SAM\u2192SAM",
+   "impl": "new -j 4",
+   "wall": 0.48,
+   "user": 1.33,
+   "sys": 0.27,
+   "rss_mib": 62.8828125
+  },
+  {
+   "dataset": "passthrough",
+   "path": "SAM\u2192SAM",
+   "impl": "new -j 8",
+   "wall": 0.45,
+   "user": 1.42,
+   "sys": 0.27,
+   "rss_mib": 88.92578125
+  },
+  {
+   "dataset": "passthrough",
+   "path": "BAM\u2192SAM",
+   "impl": "old",
+   "wall": 5.22,
+   "user": 5.14,
+   "sys": 0.06,
+   "rss_mib": 7.0
+  },
+  {
+   "dataset": "passthrough",
+   "path": "BAM\u2192SAM",
+   "impl": "new -j 0",
+   "wall": 2.73,
+   "user": 2.66,
+   "sys": 0.06,
+   "rss_mib": 54.8203125
+  },
+  {
+   "dataset": "passthrough",
+   "path": "BAM\u2192SAM",
+   "impl": "new -j 4",
+   "wall": 0.44,
+   "user": 2.89,
+   "sys": 0.11,
+   "rss_mib": 114.953125
+  },
+  {
+   "dataset": "passthrough",
+   "path": "SAM\u2192BAM -@4",
+   "impl": "old",
+   "wall": 6.29,
+   "user": 15.35,
+   "sys": 0.37,
+   "rss_mib": 8.0
+  },
+  {
+   "dataset": "passthrough",
+   "path": "SAM\u2192BAM -@4",
+   "impl": "new -j 4",
+   "wall": 2.36,
+   "user": 12.6,
+   "sys": 0.29,
+   "rss_mib": 68.88671875
+  },
+  {
+   "dataset": "passthrough",
+   "path": "BAM\u2192BAM -@4",
+   "impl": "old",
+   "wall": 8.52,
+   "user": 17.78,
+   "sys": 0.21,
+   "rss_mib": 9.0
+  },
+  {
+   "dataset": "passthrough",
+   "path": "BAM\u2192BAM -@4",
+   "impl": "new -j 0",
+   "wall": 2.36,
+   "user": 11.41,
+   "sys": 0.08,
+   "rss_mib": 58.83203125
+  },
+  {
+   "dataset": "passthrough",
+   "path": "BAM\u2192BAM -@4",
+   "impl": "new -j 4",
+   "wall": 2.36,
+   "user": 11.92,
+   "sys": 0.17,
+   "rss_mib": 107.890625
+  },
+  {
+   "dataset": "passthrough",
+   "path": "BAM\u2192BAM -@4",
+   "impl": "samtools view -b -@4",
+   "wall": 4.29,
+   "user": 17.37,
+   "sys": 0.27,
+   "rss_mib": 9.0
+  },
+  {
+   "dataset": "passthrough",
+   "path": "BAM\u2192BAM -@8",
+   "impl": "new -j 4",
+   "wall": 1.2,
+   "user": 12.22,
+   "sys": 0.18,
+   "rss_mib": 133.33203125
+  },
+  {
+   "dataset": "passthrough",
+   "path": "BAM\u2192BAM -@8",
+   "impl": "samtools view -b -@8",
+   "wall": 2.18,
+   "user": 17.32,
+   "sys": 0.28,
+   "rss_mib": 11.0
+  },
+  {
+   "dataset": "real",
+   "path": "SAM\u2192SAM",
+   "impl": "old",
+   "wall": 4.97,
+   "user": 4.83,
+   "sys": 0.13,
+   "rss_mib": 6.0
+  },
+  {
+   "dataset": "real",
+   "path": "SAM\u2192SAM",
+   "impl": "new -j 0",
+   "wall": 1.84,
+   "user": 1.7,
+   "sys": 0.12,
+   "rss_mib": 26.796875
+  },
+  {
+   "dataset": "real",
+   "path": "SAM\u2192SAM",
+   "impl": "new -j 1 (default)",
+   "wall": 1.68,
+   "user": 1.73,
+   "sys": 0.13,
+   "rss_mib": 48.83203125
+  },
+  {
+   "dataset": "real",
+   "path": "SAM\u2192SAM",
+   "impl": "new -j 4",
+   "wall": 0.5,
+   "user": 1.96,
+   "sys": 0.15,
+   "rss_mib": 86.87890625
+  },
+  {
+   "dataset": "real",
+   "path": "SAM\u2192SAM",
+   "impl": "new -j 8",
+   "wall": 0.3,
+   "user": 2.27,
+   "sys": 0.16,
+   "rss_mib": 138.94140625
+  },
+  {
+   "dataset": "real",
+   "path": "BAM\u2192SAM",
+   "impl": "old",
+   "wall": 6.19,
+   "user": 6.13,
+   "sys": 0.04,
+   "rss_mib": 7.5
+  },
+  {
+   "dataset": "real",
+   "path": "BAM\u2192SAM",
+   "impl": "new -j 0",
+   "wall": 2.63,
+   "user": 2.58,
+   "sys": 0.04,
+   "rss_mib": 48.8203125
+  },
+  {
+   "dataset": "real",
+   "path": "BAM\u2192SAM",
+   "impl": "new -j 4",
+   "wall": 0.6,
+   "user": 2.9,
+   "sys": 0.1,
+   "rss_mib": 128.94921875
+  },
+  {
+   "dataset": "real",
+   "path": "SAM\u2192BAM -@4",
+   "impl": "old",
+   "wall": 8.77,
+   "user": 15.29,
+   "sys": 0.26,
+   "rss_mib": 10.30859375
+  },
+  {
+   "dataset": "real",
+   "path": "SAM\u2192BAM -@4",
+   "impl": "new -j 4",
+   "wall": 1.7,
+   "user": 10.76,
+   "sys": 0.21,
+   "rss_mib": 92.90234375
+  },
+  {
+   "dataset": "real",
+   "path": "BAM\u2192BAM -@4",
+   "impl": "old",
+   "wall": 9.93,
+   "user": 16.52,
+   "sys": 0.19,
+   "rss_mib": 9.5
+  },
+  {
+   "dataset": "real",
+   "path": "BAM\u2192BAM -@4",
+   "impl": "new -j 0",
+   "wall": 4.45,
+   "user": 10.89,
+   "sys": 0.09,
+   "rss_mib": 55.13671875
+  },
+  {
+   "dataset": "real",
+   "path": "BAM\u2192BAM -@4",
+   "impl": "new -j 4",
+   "wall": 1.7,
+   "user": 11.85,
+   "sys": 0.13,
+   "rss_mib": 125.31640625
+  },
+  {
+   "dataset": "real",
+   "path": "BAM\u2192BAM -@4",
+   "impl": "samtools view -b -@4",
+   "wall": 2.12,
+   "user": 8.42,
+   "sys": 0.18,
+   "rss_mib": 9.0
+  },
+  {
+   "dataset": "real",
+   "path": "BAM\u2192BAM -@8",
+   "impl": "new -j 4",
+   "wall": 1.01,
+   "user": 11.65,
+   "sys": 0.11,
+   "rss_mib": 133.04296875
+  },
+  {
+   "dataset": "real",
+   "path": "BAM\u2192BAM -@8",
+   "impl": "samtools view -b -@8",
+   "wall": 1.1,
+   "user": 8.38,
+   "sys": 0.16,
+   "rss_mib": 11.5
+  }
+ ]
+}

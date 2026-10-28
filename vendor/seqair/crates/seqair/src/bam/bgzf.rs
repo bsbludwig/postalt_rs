@@ -185,6 +185,17 @@ impl<R: Read + Seek> BgzfReader<R> {
         }
     }
 
+    /// Split into the unread decompressed remainder, the compressed stream and
+    /// whether the end-of-stream block has already been reached.
+    ///
+    /// postalt extension: lets a sequential reader that has parsed the BAM header
+    /// hand the rest of the stream to `sam::stream::BgzfStream`.
+    pub fn into_parts(self) -> (Vec<u8>, BufReader<R>, bool) {
+        let mut rest = self.buf;
+        rest.drain(..self.buf_pos.min(rest.len()));
+        (rest, self.inner, self.eof)
+    }
+
     /// Read all remaining data into a Vec.
     pub fn read_to_end(&mut self, out: &mut Vec<u8>) -> Result<(), BgzfError> {
         let mut tmp = [0u8; 8192];

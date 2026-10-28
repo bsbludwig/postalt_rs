@@ -17,8 +17,8 @@ bwa-mem2 mem reference.fa reads_1.fq.gz reads_2.fq.gz \
   | ./target/release/postalt_rs reference.fa.alt \
   | samtools sort -o adjusted.bam
 
-# BAM input and output, with two BAM compression workers
-./target/release/postalt_rs -O bam -@ 2 -o adjusted.bam reference.fa.alt alignments.bam
+# BAM input and output, with four processing and four BAM compression workers
+./target/release/postalt_rs -j 4 -O bam -@ 4 -o adjusted.bam reference.fa.alt alignments.bam
 
 # Reproduce the installed k8 1.2 behavior
 ./target/release/postalt_rs --k8-1.2-compat reference.fa.alt alignments.sam > compatible.sam
@@ -29,7 +29,9 @@ bwa-mem2 mem reference.fa reads_1.fq.gz reads_2.fq.gz \
 
 Input is detected by content: SAM, gzip/BGZF SAM, or BGZF BAM, from a file or pipe. The ALT mapping file may also be gzip-compressed. Output is SAM by default; `-O bam` selects BAM independently of the filename. BAM output needs an `@SQ` dictionary containing every emitted reference. Headerless SAM remains supported for SAM output. CRAM is not supported.
 
-**Keep all records for each read name and read end contiguous, in aligner order.** Sorting only by read name can interleave mates. Primary records must precede the ALT records that adjust them. Coordinate-sorted input is unsuitable. The program holds only the current read-end group and the ALT index in memory. Output order and headers are preserved as in the script; output is not coordinate-sorted, even if an input header claims otherwise. Sort the output before indexing it.
+**Keep all records for each read name and read end contiguous, in aligner order.** Sorting only by read name can interleave mates. Primary records must precede the ALT records that adjust them. Coordinate-sorted input is unsuitable. Output order and headers are preserved as in the script; output is not coordinate-sorted, even if an input header claims otherwise. Sort the output before indexing it.
+
+Read-end groups are independent, so input is read in batches of whole groups (about 512 KiB each). With `-j N`, one thread reads, `N` threads process batches and decompress BAM input, and the main thread writes results in input order; output is byte-identical for every `-j`. At most `2N + 2` batches are in flight, so memory stays bounded apart from unusually large groups: peak RSS was about 30 MiB with `-j 0` or `-j 1` and up to about 140 MiB with `-j 8` on the validation data. `-j 0` runs everything on one thread, holding one batch at a time. Records that cannot involve an ALT contig (unmapped, or no `XA` tag and not on an ALT contig or, with `-p`, the HLA chromosome) skip hit parsing, as they would pass through the script unchanged. BAM input records stay in wire form unless they need to change: BAM output copies them verbatim when its header is the input's own.
 
 | Option | Meaning |
 | --- | --- |
@@ -39,7 +41,8 @@ Input is detected by content: SAM, gzip/BGZF SAM, or BGZF BAM, from a file or pi
 | `--version` | Print replacement version |
 | `-o FILE` | Output file; default stdout, `-` explicitly selects stdout |
 | `-O sam\|bam` | Output format; default SAM |
-| `-@ INT` | BAM compression workers; default 1; does not parallelize postalt processing |
+| `-@ INT` | BAM compression workers; default 1 |
+| `-j, --jobs INT` | Processing and BAM decompression workers; default 1; `0` runs on one thread |
 | `--compression INT` | BAM compression level 0–12; default 6 |
 | `--k8-1.2-compat` | Leave generated opposite-strand sequence and quality unchanged |
 
@@ -58,7 +61,7 @@ Preserved behavior includes:
 
 [k8 1.x removed indexed access to `Bytes`](https://github.com/attractivechaos/k8/releases/tag/v1.0), which the reference uses for reversal. The default corrects that operation using the reference's IUPAC complement table. Missing sequence/quality (`*`) remain missing. Compatibility mode reproduces the unchanged bytes from the supplied k8 1.2 runtime. Neither mode reproduces runtime memory corruption.
 
-SAM output retains original optional-field order, duplicate tags, and decimal spelling. BAM conversion uses the BAM types, so case, reference aliases, integer storage widths, and decimal spelling may normalize; comparisons should use decoded values or samtools normalization. Invalid records and unsupported CLI options produce explicit errors rather than reproducing JavaScript coercions or crashes.
+SAM output retains original optional-field order, duplicate tags, and decimal spelling, except that FLAG, POS and MAPQ are always written in canonical decimal form (as the script's `parseInt` does). Records that need no change are written byte for byte. BAM conversion uses the BAM types, so case, reference aliases, integer storage widths, and decimal spelling may normalize; comparisons should use decoded values or samtools normalization. Invalid records and unsupported CLI options produce explicit errors rather than reproducing JavaScript coercions or crashes. Records that pass through without ALT processing are not CIGAR-checked, matching the script. On an error, output contains exactly what sequential processing would have written before stopping, regardless of `-j`.
 
 ## Tests
 
@@ -92,7 +95,7 @@ python3 scripts/benchmark.py reference.fa.alt target/validation/real/input.sam \
 
 Extraction includes all `_alt` references and `chr6:30000000-31000000`. The script sorts by name, then groups read ends and puts original primary records first. This simulates streaming input; it cannot reconstruct the aligner's original order or restore records/tags already changed by earlier processing. It selects alignments in these regions, not every distant alignment of the same template.
 
-The implementation precomputes ALT CIGAR segments for binary-search projection and uses sorted interval indexes with prefix maxima. Buffered I/O and read-end-local processing avoid whole-file storage. Seqair supplies BGZF decompression and multithreaded compression. See [vendor/seqair/POSTALT_PATCHES.md](vendor/seqair/POSTALT_PATCHES.md) for the pinned upstream revision and the streaming adapter.
+The implementation precomputes ALT CIGAR segments for binary-search projection and uses sorted interval indexes with prefix maxima. Each SAM record lives in one reused buffer, records are recycled between groups, pass-through records skip parsing, and BAM records are copied without a text round trip; mimalloc serves the remaining allocations. Batched, read-end-local processing avoids whole-file storage. Seqair supplies BGZF framing, decompression and multithreaded compression. See [vendor/seqair/POSTALT_PATCHES.md](vendor/seqair/POSTALT_PATCHES.md) for the pinned upstream revision and the streaming adapter.
 
 ## License
 

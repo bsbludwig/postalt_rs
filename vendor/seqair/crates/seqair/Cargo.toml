@@ -28,6 +28,7 @@ tracing = { workspace = true }
 bytemuck = { workspace = true }
 indexmap = "2"
 itoa = "1"
+memchr = "2"
 libdeflater = "1.26.1"
 seqair-types = { version = "^0.4.0", path = "../seqair-types", default-features = false }
 rustc-hash = "2.1.3"

@@ -34,6 +34,8 @@ This is a modified implementation, not an upstream BWA release. Changes made on
 2026-10-27 include translation to Rust, precomputed projection/index structures,
 seqair-based streaming I/O, direct BAM support, corrected reversal by default,
 and an explicit mode reproducing the supplied k8 runtime's reversal behavior.
+Changes made on 2026-10-28 add batch-parallel processing, wire-form BAM
+pass-through, allocation reuse and the mimalloc allocator; output is unchanged.
 Preserved quirks and intentional differences are described in [README.md](README.md)
 and the source comments. Test-only reference repairs are documented in
 `scripts/compatibility.py`; they do not modify the installed script.

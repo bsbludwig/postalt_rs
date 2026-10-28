@@ -1,157 +1,369 @@
 //! Text-preserving sequential SAM/BAM adapter for postalt_rs.
 //!
-//! Keeps original SAM fields (including duplicate tags and decimal spelling).
-//! Uses seqair's CIGAR/aux parsers, BAM wire validation and sequence codecs.
+//! Keeps original SAM text (including duplicate tags and decimal spelling) in one
+//! reusable buffer per record. Uses seqair's CIGAR/aux parsers, BAM wire
+//! validation, sequence codecs and BGZF framing.
 //!
 //! This module is a local extension, not an upstream seqair streaming API. The
 //! indexed/pileup APIs cannot preserve all required SAM text, unplaced records
 //! and IUPAC bases. BAM conversion is necessarily semantic rather than lexical:
 //! integer widths, float spelling, sequence case and RNEXT aliases can normalize.
-//! Parsing is deliberately layered; `SamRecord::parse` does not validate every
+//! [`BamRecord`] therefore keeps BAM input in wire form, so records that need no
+//! change can be written back without any text round trip.
+//!
+//! Parsing is deliberately layered; [`SamRecord::parse`] does not validate every
 //! optional field or eagerly decode the sequence/CIGAR of pass-through records.
 use crate::bam::aux::{self, AuxValue};
-use crate::bam::{self, AuxData, BamHeader, CigarOp, MateFields, OwnedBamRecord};
-use seqair_types::{BamFlags, Base, BaseQuality, MappingQuality, Pos0};
-use std::{
-    io::{self, Write},
-    num::NonZeroI32,
-};
+use crate::bam::bgzf::{BgzfError, find_bsize};
+use crate::bam::cigar::{CIGAR_D, CIGAR_EQ, CIGAR_M, CIGAR_N, CIGAR_X};
+use crate::bam::owned_record::OwnedRecordError;
+use crate::bam::{self, AuxData, BamHeader, CigarOp, MateFields};
+use crate::reader::Tid;
+use seqair_types::{MappingQuality, Pos0};
+use std::collections::VecDeque;
+use std::io::{self, Read, Write};
+use std::num::NonZeroI32;
+use std::sync::{Arc, Mutex, mpsc};
+use std::thread;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// Owned SAM fields with separately mutable numeric values used by postalt.
+/// Largest BAM payload accepted on input or produced on output (seqair's limit).
+pub const MAX_BAM_RECORD: usize = 2 * 1024 * 1024;
+
+/// One SAM alignment line with its FLAG, POS and MAPQ decoded.
 ///
 /// # Invariants
 ///
-/// `fields` must contain at least the eleven mandatory SAM columns. `flag`,
-/// `pos` and `mapq` are authoritative: serialization uses them instead of the
-/// potentially stale strings at indices 1, 3 and 4. All other fields, including
-/// duplicate tags, retain their order and spelling until BAM conversion.
-/// Construct through the parsers or maintain these invariants when editing.
-#[derive(Clone, Debug)]
+/// `text` holds the line without its terminator and is exactly what SAM output
+/// writes. FLAG, POS and MAPQ are kept in canonical decimal spelling (parsing
+/// rewrites e.g. `0016` as `16`) and agree with the decoded values; the setters
+/// maintain this. All other fields, including duplicate tags, retain their
+/// order and bytes. `ends[i]` is the exclusive end offset of field `i`.
+/// A record left behind by a failed parse is unspecified until reparsed.
+#[derive(Clone, Debug, Default)]
 pub struct SamRecord {
-    /// Eleven core SAM columns followed by optional fields, in original order.
-    pub fields: Vec<String>,
-    /// SAM FLAG bits, overriding `fields[1]` on output.
-    pub flag: u16,
-    /// One-based SAM POS, or zero for unavailable; overrides `fields[3]`.
-    pub pos: i64,
-    /// SAM MAPQ including the 255 unavailable sentinel; overrides `fields[4]`.
-    pub mapq: u8,
+    text: Vec<u8>,
+    ends: Vec<u32>,
+    flag: u16,
+    pos: i64,
+    mapq: u8,
 }
 impl SamRecord {
-    /// Split one alignment line, stripping CR/LF but retaining optional-field text.
+    /// Parse one alignment line; see [`Self::parse_into`].
+    ///
+    /// # Errors
+    /// As [`Self::parse_into`].
+    pub fn parse(line: &[u8]) -> Result<Self> {
+        let mut record = Self::default();
+        record.parse_into(line)?;
+        Ok(record)
+    }
+
+    /// Replace this record's contents with `line`, reusing its allocations.
+    ///
+    /// Trailing CR/LF bytes are stripped; optional-field text is retained.
     ///
     /// # Errors
     /// Rejects fewer than eleven fields, invalid FLAG/MAPQ integers, and POS
     /// outside 0..=i32::MAX. CIGAR, sequence, mate fields and aux values are decoded
     /// only when needed later. This is stricter than JS numeric coercion but is
     /// not a comprehensive SAM validator; header lines belong to the caller.
-    pub fn parse(line: &str) -> Result<Self> {
-        let fields: Vec<String> =
-            line.trim_end_matches(['\r', '\n']).split('\t').map(str::to_owned).collect();
-        if fields.len() < 11 {
+    pub fn parse_into(&mut self, line: &[u8]) -> Result<()> {
+        let len = line.iter().rposition(|&b| b != b'\r' && b != b'\n').map_or(0, |i| i + 1);
+        self.text.clear();
+        self.text.extend_from_slice(&line[..len]);
+        self.index_fields()?;
+        if self.ends.len() < 11 {
             return Err("expected at least 11 SAM fields".into());
         }
-        let flag = fields[1].parse()?;
-        let pos = fields[3].parse()?;
-        let mapq = fields[4].parse()?;
-        if !(0..=i32::MAX as i64).contains(&pos) {
+        let flag = parse_number(self.field(1))?;
+        let pos = parse_number(self.field(3))?;
+        let mapq = parse_number(self.field(4))?;
+        if !(0..=i64::from(i32::MAX)).contains(&pos) {
             return Err("SAM POS out of range".into());
         }
-        Ok(Self { fields, flag, pos, mapq })
-    }
-    /// Write TAB-separated fields and a newline, using the numeric overrides.
-    ///
-    /// Duplicate optional tags and their decimal spelling are retained. Returns
-    /// an I/O error on failure; some fields may already have been written.
-    pub fn write_sam(&self, out: &mut impl Write) -> io::Result<()> {
-        for (i, field) in self.fields.iter().enumerate() {
-            if i > 0 {
-                out.write_all(b"\t")?;
-            }
-            match i {
-                1 => write!(out, "{}", self.flag)?,
-                3 => write!(out, "{}", self.pos)?,
-                4 => write!(out, "{}", self.mapq)?,
-                _ => out.write_all(field.as_bytes())?,
-            }
+        (self.flag, self.pos, self.mapq) = (flag, pos, mapq);
+        // Output has always used the decoded values, so normalize unusual
+        // spellings (leading zeros or '+') once here instead of at every write.
+        if !is_canonical(self.field(1)) {
+            self.replace_number(1, u64::from(flag));
         }
-        out.write_all(b"\n")
+        if !is_canonical(self.field(3)) {
+            self.replace_number(3, pos.unsigned_abs());
+        }
+        if !is_canonical(self.field(4)) {
+            self.replace_number(4, u64::from(mapq));
+        }
+        Ok(())
     }
-    /// Return the first matching optional-field suffix, e.g. for `"XA:Z:"`.
-    /// This mirrors r985's first regex match for NM/XA/RG, not its last-match scan
-    /// of buffered om/pa tags. Duplicate tags are neither collapsed nor removed.
-    pub fn tag(&self, prefix: &str) -> Option<&str> {
-        self.fields[11..].iter().find_map(|s| s.strip_prefix(prefix))
-    }
-    /// Decode field 6 through seqair's CIGAR parser; `*` yields no operations.
-    /// Returns recognized parse errors without applying postalt scoring rules.
-    pub fn cigar(&self) -> Result<Vec<CigarOp>> {
-        let mut out = Vec::new();
-        super::reader::parse_cigar(self.fields[5].as_bytes(), &mut out)?;
-        Ok(out)
-    }
-    /// Resolve SAM references and encode typed fields for seqair's owned writer.
+
+    /// Replace this record with text written by `write`, without revalidation.
     ///
-    /// # Sequence limitation
-    /// `OwnedBamRecord` uses the five-base pileup alphabet, so this intermediate
-    /// value loses non-ACGT ambiguity codes. Use `BamWriter::write_sam_record` to
-    /// restore the original IUPAC nibbles before emitting a BAM record. Do not
-    /// directly serialize this intermediate when full sequence fidelity matters.
-    ///
-    /// Aux fields are encoded in order, preserving duplicates. Missing sequence,
-    /// quality and positions use the owned representation's empty/None sentinels.
+    /// For records generated by the caller. The text must contain at least
+    /// eleven TAB-separated fields, and fields 1, 3 and 4 must be the canonical
+    /// decimal spelling of `flag`, `pos` and `mapq` (not checked in release).
     ///
     /// # Errors
-    /// Returns unknown-reference, mate-coordinate, CIGAR, quality, auxiliary-value
-    /// or owned-record construction errors. Requires the `SamRecord` invariants.
-    pub fn to_owned_bam(&self, header: &BamHeader) -> Result<OwnedBamRecord> {
-        let resolve = |name: &str| -> Result<_> {
-            if name == "*" {
-                Ok(None)
-            } else {
-                Ok(Some(
-                    header
-                        .tid(name)
-                        .ok_or_else(|| format!("reference {name} missing from SAM @SQ header"))?,
-                ))
+    /// Returns an error if the text has fewer than eleven fields or is too long.
+    pub fn assemble(
+        &mut self,
+        flag: u16,
+        pos: i64,
+        mapq: u8,
+        write: impl FnOnce(&mut Vec<u8>),
+    ) -> Result<()> {
+        self.text.clear();
+        write(&mut self.text);
+        self.index_fields()?;
+        if self.ends.len() < 11 {
+            return Err("expected at least 11 SAM fields".into());
+        }
+        (self.flag, self.pos, self.mapq) = (flag, pos, mapq);
+        debug_assert_eq!(self.field(1), itoa::Buffer::new().format(flag).as_bytes());
+        debug_assert_eq!(self.field(3), itoa::Buffer::new().format(pos).as_bytes());
+        debug_assert_eq!(self.field(4), itoa::Buffer::new().format(mapq).as_bytes());
+        Ok(())
+    }
+
+    /// Record the field boundaries of `text`.
+    fn index_fields(&mut self) -> Result<()> {
+        let len = u32::try_from(self.text.len()).map_err(|_| "SAM line too long")?;
+        self.ends.clear();
+        // Positions are below `len`, which fits in u32.
+        self.ends.extend(memchr::memchr_iter(b'\t', &self.text).map(|i| i as u32));
+        self.ends.push(len);
+        Ok(())
+    }
+
+    /// Field `i` (zero-based SAM column). Panics if `i >= self.field_count()`.
+    pub fn field(&self, i: usize) -> &[u8] {
+        let start = if i == 0 { 0 } else { self.ends[i - 1] as usize + 1 };
+        &self.text[start..self.ends[i] as usize]
+    }
+    /// Number of TAB-separated fields, at least eleven for a parsed record.
+    pub fn field_count(&self) -> usize {
+        self.ends.len()
+    }
+    /// QNAME bytes.
+    pub fn qname(&self) -> &[u8] {
+        self.field(0)
+    }
+    /// SAM FLAG bits.
+    pub fn flag(&self) -> u16 {
+        self.flag
+    }
+    /// One-based SAM POS, or zero for unavailable.
+    pub fn pos(&self) -> i64 {
+        self.pos
+    }
+    /// SAM MAPQ including the 255 unavailable sentinel.
+    pub fn mapq(&self) -> u8 {
+        self.mapq
+    }
+    /// The whole line without terminator, as SAM output writes it.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.text
+    }
+
+    /// Set FLAG and rewrite its text.
+    pub fn set_flag(&mut self, flag: u16) {
+        if flag != self.flag {
+            self.flag = flag;
+            self.replace_number(1, u64::from(flag));
+        }
+    }
+    /// Set MAPQ and rewrite its text.
+    pub fn set_mapq(&mut self, mapq: u8) {
+        if mapq != self.mapq {
+            self.mapq = mapq;
+            self.replace_number(4, u64::from(mapq));
+        }
+    }
+    /// Replace field `i` with the decimal spelling of `value`.
+    fn replace_number(&mut self, i: usize, value: u64) {
+        let mut buffer = itoa::Buffer::new();
+        self.replace_field(i, buffer.format(value).as_bytes());
+    }
+    /// Replace field `i`, shifting later field boundaries.
+    fn replace_field(&mut self, i: usize, value: &[u8]) {
+        let start = if i == 0 { 0 } else { self.ends[i - 1] as usize + 1 };
+        let end = self.ends[i] as usize;
+        self.text.splice(start..end, value.iter().copied());
+        // Lines are bounded by u32 (checked when indexed); MAPQ/FLAG/POS text
+        // cannot grow a record by more than a few bytes.
+        let shift =
+            |e: &mut u32| *e = (i64::from(*e) + value.len() as i64 - (end - start) as i64) as u32;
+        self.ends[i..].iter_mut().for_each(shift);
+    }
+    /// Append one optional field after a TAB.
+    pub fn push_field(&mut self, field: &[u8]) {
+        self.text.push(b'\t');
+        self.text.extend_from_slice(field);
+        self.ends.push(self.text.len() as u32);
+    }
+    /// Append one formatted optional field after a TAB.
+    pub fn push_field_fmt(&mut self, args: std::fmt::Arguments<'_>) {
+        self.text.push(b'\t');
+        // Writing to a Vec cannot fail.
+        let _ = self.text.write_fmt(args);
+        self.ends.push(self.text.len() as u32);
+    }
+
+    /// Optional fields (column 12 onward), in order.
+    pub fn tags(&self) -> impl Iterator<Item = &[u8]> {
+        (11..self.ends.len()).map(|i| self.field(i))
+    }
+    /// Return the first matching optional-field suffix, e.g. for `b"XA:Z:"`.
+    /// This mirrors r985's first regex match for NM/XA/RG, not its last-match scan
+    /// of buffered om/pa tags. Duplicate tags are neither collapsed nor removed.
+    pub fn tag(&self, prefix: &[u8]) -> Option<&[u8]> {
+        self.tags().find_map(|s| s.strip_prefix(prefix))
+    }
+
+    /// Append the line and a newline to `out`.
+    pub fn append_sam(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.text);
+        out.push(b'\n');
+    }
+    /// Write the line and a newline. Some bytes may be written on failure.
+    pub fn write_sam(&self, out: &mut impl Write) -> io::Result<()> {
+        out.write_all(&self.text)?;
+        out.write_all(b"\n")
+    }
+
+    /// Append this record as a size-prefixed BAM record for `header`.
+    ///
+    /// Resolves SAM references, keeps full IUPAC bases (case-folded, as BAM
+    /// stores them), and encodes optional fields in order, preserving
+    /// duplicates. Missing sequence/quality use BAM's empty/0xFF conventions.
+    /// `out` is unchanged on error.
+    ///
+    /// # Errors
+    /// Returns unknown-reference, coordinate, CIGAR, quality, auxiliary-value or
+    /// BAM field-limit errors.
+    pub fn append_bam(
+        &self,
+        header: &BamHeader,
+        encoder: &mut BamEncoder,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        let start = out.len();
+        let result = self.encode_bam(header, encoder, out);
+        if result.is_err() {
+            out.truncate(start);
+        }
+        result
+    }
+
+    fn encode_bam(
+        &self,
+        header: &BamHeader,
+        encoder: &mut BamEncoder,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
+        let resolve = |name: &[u8]| -> Result<Option<Tid>> {
+            if name == b"*" {
+                return Ok(None);
             }
+            let name = std::str::from_utf8(name)?;
+            let tid = header
+                .tid(name)
+                .ok_or_else(|| format!("reference {name} missing from SAM @SQ header"))?;
+            Ok(Some(tid))
         };
-        let tid = resolve(&self.fields[2])?;
+        let tid = resolve(self.field(2))?;
         let pos = if self.pos == 0 { None } else { Some(Pos0::try_from(self.pos - 1)?) };
-        let mate_tid = if self.fields[6] == "=" { tid } else { resolve(&self.fields[6])? };
-        let pn: i64 = self.fields[7].parse()?;
+        let mate_tid = if self.field(6) == b"=" { tid } else { resolve(self.field(6))? };
+        let pn: i64 = parse_number(self.field(7))?;
         let mate_pos = if pn == 0 { None } else { Some(Pos0::try_from(pn - 1)?) };
-        let seq = if self.fields[9] == "*" {
-            Vec::new()
+        let template_len = NonZeroI32::new(parse_number(self.field(8))?);
+        let qname = self.field(0);
+        if qname.len() > 254 {
+            return Err(OwnedRecordError::QnameTooLong { len: qname.len() }.into());
+        }
+        encoder.cigar.clear();
+        super::reader::parse_cigar(self.field(5), &mut encoder.cigar)?;
+        let n_cigar_op = u16::try_from(encoder.cigar.len())
+            .map_err(|_| OwnedRecordError::CigarCountOverflow { count: encoder.cigar.len() })?;
+        let seq = if self.field(9) == b"*" { &[][..] } else { self.field(9) };
+        let qual = if self.field(10) == b"*" { &[][..] } else { self.field(10) };
+        let l_seq = i32::try_from(seq.len())
+            .map_err(|_| OwnedRecordError::SeqLengthOverflow { len: seq.len() })?;
+        if qual.iter().any(|&b| b < 33) {
+            return Err("invalid SAM quality".into());
+        }
+        if !qual.is_empty() && qual.len() != seq.len() {
+            return Err(OwnedRecordError::SeqQualLengthMismatch {
+                seq_len: seq.len(),
+                qual_len: qual.len(),
+            }
+            .into());
+        }
+
+        // Same bin as OwnedBamRecord::bin(): reference span of M/D/N/=/X.
+        let ref_len: u64 = encoder
+            .cigar
+            .iter()
+            .filter(|op| matches!(op.op_code(), CIGAR_M | CIGAR_D | CIGAR_N | CIGAR_EQ | CIGAR_X))
+            .map(|op| u64::from(op.len()))
+            .sum();
+        let beg = pos.map_or(0, Pos0::as_u64);
+        let end = pos.map_or(beg + 1, |p| {
+            let end = p.as_u64().saturating_add(ref_len).min(Pos0::MAX.as_u64());
+            if end <= beg { beg + 1 } else { end }
+        });
+        // BAI bins with min_shift=14, depth=5 are below 37450.
+        let bin = crate::io::reg2bin(beg, end, 14, 5) as u16;
+
+        let start = out.len();
+        out.extend_from_slice(&[0; 4]);
+        bam::record::encode_fixed_header(
+            out,
+            &bam::record::FixedHeaderFields {
+                tid,
+                pos,
+                bin,
+                mapq: MappingQuality::from_byte(self.mapq),
+                // qname.len() <= 254 checked above.
+                l_read_name: qname.len() as u8 + 1,
+                flags: self.flag,
+                n_cigar_op,
+                l_seq,
+                mate_fields: MateFields { tid: mate_tid, pos: mate_pos, template_len },
+            },
+        );
+        out.extend_from_slice(qname);
+        out.push(0);
+        for op in &encoder.cigar {
+            out.extend_from_slice(&op.to_bam_u32().to_le_bytes());
+        }
+        // The packed table only folds a/c/g/t; upper-case first to keep
+        // lower-case ambiguity codes, as the previous owned-record path did.
+        encoder.bases.clear();
+        encoder.bases.extend(seq.iter().map(u8::to_ascii_uppercase));
+        bam::seq::encode_seq_into(&encoder.bases, out);
+        if qual.is_empty() {
+            out.resize(out.len() + seq.len(), 0xFF);
         } else {
-            Base::from_ascii_vec(self.fields[9].as_bytes().to_vec())
-        };
-        let qual = if self.fields[10] == "*" {
-            Vec::new()
-        } else {
-            self.fields[10]
-                .bytes()
-                .map(|b| b.checked_sub(33).map(BaseQuality::from_byte).ok_or("invalid SAM quality"))
-                .collect::<std::result::Result<Vec<_>, _>>()?
-        };
+            out.extend(qual.iter().map(|&b| b - 33));
+        }
         // Encode each field independently. Setting all tags on one AuxData map
         // would replace duplicates, unlike the reference's append-only behavior.
-        let mut aux = Vec::new();
-        for field in &self.fields[11..] {
+        for field in self.tags() {
             // BAM's double-precision extension is not handled by the indexed
             // SAM parser. Retain it through the existing AuxData encoder.
-            if field.as_bytes().get(2..5) == Some(b":d:") {
+            if field.get(2..5) == Some(b":d:") {
                 let mut tag = AuxData::new();
-                tag.set_double(field.as_bytes()[..2].try_into()?, field[5..].parse()?);
-                aux.extend_from_slice(tag.as_bytes());
-            } else if field.len() == 6 && field.as_bytes().get(2..5) == Some(b":B:") {
+                let value: f64 = parse_number(&field[5..])?;
+                tag.set_double(field[..2].try_into()?, value);
+                out.extend_from_slice(tag.as_bytes());
+            } else if field.len() == 6 && field.get(2..5) == Some(b":B:") {
                 // Empty BAM arrays have a subtype and zero elements. The indexed
                 // parser treats the absent element text as one invalid element.
                 let mut tag = AuxData::new();
-                let key = field.as_bytes()[..2].try_into()?;
-                match field.as_bytes()[5] {
+                let key = field[..2].try_into()?;
+                match field[5] {
                     b'c' => tag.set_array_i8(key, &[])?,
                     b'C' => tag.set_array_u8(key, &[])?,
                     b's' => tag.set_array_i16(key, &[])?,
@@ -161,36 +373,74 @@ impl SamRecord {
                     b'f' => tag.set_array_f32(key, &[])?,
                     _ => return Err("invalid empty BAM array subtype".into()),
                 }
-                aux.extend_from_slice(tag.as_bytes());
+                out.extend_from_slice(tag.as_bytes());
             } else {
-                super::reader::parse_aux_tags(field.as_bytes(), &mut aux)?;
+                super::reader::parse_aux_tags(field, out)?;
             }
         }
-        Ok(OwnedBamRecord::builder(tid, pos, self.fields[0].as_bytes().to_vec())
-            .flags(BamFlags::from(self.flag))
-            .mapq(MappingQuality::from_byte(self.mapq))
-            .mate_fields(MateFields {
-                tid: mate_tid,
-                pos: mate_pos,
-                template_len: NonZeroI32::new(self.fields[8].parse()?),
-            })
-            .cigar(self.cigar()?)
-            .seq(seq)
-            .qual(qual)
-            .aux(AuxData::from_bytes(aux))
-            .build()?)
+        let size = out.len() - start - 4;
+        if size > MAX_BAM_RECORD {
+            return Err(
+                format!("BAM record size {size} exceeds {MAX_BAM_RECORD} byte limit").into()
+            );
+        }
+        // size <= 2 MiB fits in i32.
+        out[start..start + 4].copy_from_slice(&(size as i32).to_le_bytes());
+        Ok(())
     }
-    /// Decode one BAM payload (without its block_size prefix) into SAM fields.
+}
+
+/// Reusable scratch buffers for [`SamRecord::append_bam`].
+#[derive(Debug, Default)]
+pub struct BamEncoder {
+    cigar: Vec<CigarOp>,
+    bases: Vec<u8>,
+}
+
+/// Whether a numeric SAM field is already in canonical decimal spelling.
+fn is_canonical(field: &[u8]) -> bool {
+    !field.is_empty()
+        && field.iter().all(u8::is_ascii_digit)
+        && (field.len() == 1 || field[0] != b'0')
+}
+
+/// Parse a number with Rust's `FromStr` rules (e.g. a leading `+` is accepted).
+pub fn parse_number<T>(field: &[u8]) -> Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    Ok(std::str::from_utf8(field)?.parse()?)
+}
+
+/// One validated BAM record kept in wire form (payload without `block_size`).
+///
+/// Unplaced records are retained, unlike seqair's indexed read path. Reading
+/// metadata does not decode the sequence, CIGAR or auxiliary data, and
+/// [`Self::append_bam`] re-emits the payload byte for byte.
+#[derive(Clone, Debug, Default)]
+pub struct BamRecord {
+    raw: Vec<u8>,
+    var_start: usize,
+    cigar_end: usize,
+    seq_end: usize,
+    qual_end: usize,
+}
+impl BamRecord {
+    /// Payload buffer to fill before [`Self::validate`]; its capacity is reused.
+    pub fn buffer_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.raw
+    }
+    /// Check the payload layout and references against `header`.
     ///
-    /// Unplaced records are retained, unlike seqair's indexed read path. Temporary
-    /// POS normalization is restored before propagating any parser error, leaving
-    /// the caller's payload unchanged. Sequence decoding retains full IUPAC codes.
+    /// Temporary POS normalization is restored before propagating any parser
+    /// error, leaving the payload unchanged.
     ///
     /// # Errors
-    /// Returns truncated-layout, reference/position, read-name or text-conversion
-    /// errors. Auxiliary iteration uses upstream seqair's permissive iterator;
-    /// this is not a complete malformed-aux validator.
-    pub fn from_bam(raw: &mut [u8], header: &BamHeader) -> Result<Self> {
+    /// Returns truncated-layout, reference/position or read-name errors.
+    /// Auxiliary data is not validated here; see [`Self::to_sam`].
+    pub fn validate(&mut self, header: &BamHeader) -> Result<()> {
+        let raw = &mut self.raw;
         // Indexed seqair's wire parser requires a placed position. Normalize only
         // for validation, then restore BAM's -1 sentinel for streaming unmapped reads.
         if raw.len() < 32 {
@@ -203,92 +453,179 @@ impl SamRecord {
         let parsed = bam::record::parse_header(raw);
         raw[4..8].copy_from_slice(&pos.to_le_bytes());
         let h = parsed?;
-        let refs = h.refs.resolve(header)?;
+        h.refs.resolve(header)?;
         if h.var_start <= 32 || raw[h.var_start - 1] != 0 {
             return Err("invalid BAM read name".into());
         }
-        let name = |tid| header.target_name(tid).unwrap_or("*").to_owned();
-        let mut cigar = Vec::new();
-        CigarOp::extend_from_bam_bytes(&mut cigar, &raw[h.var_start..h.cigar_end]);
+        (self.var_start, self.cigar_end, self.seq_end, self.qual_end) =
+            (h.var_start, h.cigar_end, h.seq_end, h.qual_end);
+        Ok(())
+    }
+    /// The payload bytes as stored in BAM.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.raw
+    }
+    /// QNAME bytes without the terminating NUL.
+    pub fn qname(&self) -> &[u8] {
+        &self.raw[32..self.var_start - 1]
+    }
+    /// FLAG bits.
+    pub fn flag(&self) -> u16 {
+        u16::from_le_bytes([self.raw[14], self.raw[15]])
+    }
+    /// MAPQ byte.
+    pub fn mapq(&self) -> u8 {
+        self.raw[9]
+    }
+    /// Reference index, or `None` for BAM's `-1` (validated against the header).
+    pub fn tid(&self) -> Option<usize> {
+        usize::try_from(i32::from_le_bytes([self.raw[0], self.raw[1], self.raw[2], self.raw[3]]))
+            .ok()
+    }
+    /// Raw auxiliary data.
+    pub fn aux(&self) -> &[u8] {
+        &self.raw[self.qual_end..]
+    }
+    /// Whether a string-typed tag decodes (as SAM text would show `XX:Z:`).
+    /// Iteration stops silently at malformed data, as [`Self::to_sam`] does.
+    pub fn has_string_tag(&self, tag: [u8; 2]) -> bool {
+        aux::iter_tags(self.aux()).any(|(t, v)| t == tag && matches!(v, AuxValue::String(_)))
+    }
+    /// Append `block_size` and the unchanged payload.
+    pub fn append_bam(&self, out: &mut Vec<u8>) {
+        // Payloads are at most MAX_BAM_RECORD bytes.
+        out.extend_from_slice(&(self.raw.len() as i32).to_le_bytes());
+        out.extend_from_slice(&self.raw);
+    }
+
+    /// Decode into `out` as SAM text, retaining full IUPAC sequence codes.
+    ///
+    /// All scalar integer widths become `i`; arrays retain their subtype and
+    /// order. Rust's float display may differ lexically from k8/samtools while
+    /// representing the same stored value. Empty arrays emit only their subtype,
+    /// e.g. `XX:B:i`. `header` must be the one used by [`Self::validate`].
+    ///
+    /// # Errors
+    /// Returns an error only if the record was not validated against `header`.
+    pub fn to_sam(&self, header: &BamHeader, out: &mut SamRecord) -> Result<()> {
+        let raw = &self.raw;
+        let word = |at: usize| i32::from_le_bytes([raw[at], raw[at + 1], raw[at + 2], raw[at + 3]]);
+        let name = |id: i32| -> Result<&[u8]> {
+            Ok(match Tid::from_wire(id, header)? {
+                Some(tid) => header.target_name(tid).unwrap_or("*").as_bytes(),
+                None => b"*",
+            })
+        };
+        let (tid, pos, mate_tid, mate_pos, tlen) = (word(0), word(4), word(20), word(24), word(28));
+        let (flag, mapq) = (self.flag(), self.mapq());
+        let pos = i64::from(pos) + 1;
+        let mut numbers = itoa::Buffer::new();
+        let t = &mut out.text;
+        t.clear();
+        t.extend_from_slice(self.qname());
+        t.push(b'\t');
+        t.extend_from_slice(numbers.format(flag).as_bytes());
+        t.push(b'\t');
+        t.extend_from_slice(name(tid)?);
+        t.push(b'\t');
+        t.extend_from_slice(numbers.format(pos).as_bytes());
+        t.push(b'\t');
+        t.extend_from_slice(numbers.format(mapq).as_bytes());
+        t.push(b'\t');
+        let cigar = &raw[self.var_start..self.cigar_end];
+        if cigar.is_empty() {
+            t.push(b'*');
+        }
+        for op in cigar.chunks_exact(4) {
+            let op = CigarOp::from_bam_u32(u32::from_le_bytes(op.try_into()?));
+            write!(t, "{op}")?;
+        }
+        t.push(b'\t');
+        if mate_tid >= 0 && mate_tid == tid {
+            t.push(b'=');
+        } else {
+            t.extend_from_slice(name(mate_tid)?);
+        }
+        t.push(b'\t');
+        t.extend_from_slice(
+            numbers.format(if mate_pos < 0 { 0 } else { i64::from(mate_pos) + 1 }).as_bytes(),
+        );
+        t.push(b'\t');
+        t.extend_from_slice(numbers.format(tlen).as_bytes());
+        t.push(b'\t');
         // Decode raw nibbles directly: RecordStore's Base conversion would turn
         // ambiguity codes into N before postalt could emit or reverse them.
-        let seq = bam::seq::decode_seq(&raw[h.cigar_end..h.seq_end], h.seq_len as usize);
-        let qual = &raw[h.seq_end..h.qual_end];
-        let mut fields = vec![
-            String::from_utf8(raw[32..h.var_start - 1].to_vec())?,
-            h.flags.to_string(),
-            refs.tid.map(name).unwrap_or_else(|| "*".into()),
-            (pos as i64 + 1).to_string(),
-            h.mapq.as_byte().to_string(),
-            if cigar.is_empty() { "*".into() } else { bam::CigarStr(&cigar).to_string() },
-            if refs.mate_fields.tid.is_some() && refs.mate_fields.tid == refs.tid {
-                "=".into()
-            } else {
-                refs.mate_fields.tid.map(name).unwrap_or_else(|| "*".into())
-            },
-            refs.mate_fields.pos.map(|p| p.as_u64() + 1).unwrap_or(0).to_string(),
-            refs.mate_fields.template_len.map(|n| n.get()).unwrap_or(0).to_string(),
-            if seq.is_empty() { "*".into() } else { String::from_utf8(seq)? },
-            if qual.is_empty() || qual[0] == 255 {
-                "*".into()
-            } else {
-                String::from_utf8(qual.iter().map(|q| q.saturating_add(33)).collect())?
-            },
-        ];
-        for tag in aux::iter_tags(&raw[h.qual_end..]) {
-            let (tag, value) = tag;
-            let prefix = std::str::from_utf8(&tag)?;
-            fields.push(format_aux(prefix, value)?);
+        let seq_len = self.qual_end - self.seq_end;
+        if seq_len == 0 {
+            t.push(b'*');
+        } else {
+            t.extend_from_slice(&bam::seq::decode_seq(&raw[self.cigar_end..self.seq_end], seq_len));
         }
-        Ok(Self { flag: u16::from(h.flags), pos: pos as i64 + 1, mapq: h.mapq.as_byte(), fields })
+        t.push(b'\t');
+        let qual = &raw[self.seq_end..self.qual_end];
+        if qual.is_empty() || qual[0] == 255 {
+            t.push(b'*');
+        } else {
+            t.extend(qual.iter().map(|q| q.saturating_add(33)));
+        }
+        for (tag, value) in aux::iter_tags(self.aux()) {
+            t.push(b'\t');
+            t.extend_from_slice(&tag);
+            write_aux(t, value)?;
+        }
+        out.index_fields()?;
+        (out.flag, out.pos, out.mapq) = (flag, pos, mapq);
+        Ok(())
     }
-}
-/// Format a decoded BAM value using its SAM representation.
-///
-/// All scalar integer widths become `i`; arrays retain their subtype and order.
-/// Rust's float display may differ lexically from k8/samtools while representing
-/// the same stored value. Empty arrays emit only their subtype, e.g. `XX:B:i`.
-fn format_aux(tag: &str, value: AuxValue<'_>) -> Result<String> {
-    use AuxValue::*;
-    if let Some(n) = value.as_i64() {
-        return Ok(format!("{tag}:i:{n}"));
-    }
-    let mut s;
-    macro_rules! array {
-        ($bytes:expr, $typ:ty, $sub:literal) => {{
-            s = format!("{tag}:B:{}", $sub);
-            for chunk in $bytes.chunks_exact(size_of::<$typ>()) {
-                use std::fmt::Write;
-                write!(s, ",{}", <$typ>::from_le_bytes(chunk.try_into()?))?;
-            }
-            s
-        }};
-    }
-    Ok(match value {
-        Char(c) => format!("{tag}:A:{}", c as char),
-        Float(f) => format!("{tag}:f:{f}"),
-        Double(f) => format!("{tag}:d:{f}"),
-        String(v) => format!("{tag}:Z:{}", std::str::from_utf8(v)?),
-        Hex(v) => format!("{tag}:H:{}", std::str::from_utf8(v)?),
-        ArrayI8(b) => array!(b, i8, 'c'),
-        ArrayU8(b) => array!(b, u8, 'C'),
-        ArrayI16(b) => array!(b, i16, 's'),
-        ArrayU16(b) => array!(b, u16, 'S'),
-        ArrayI32(b) => array!(b, i32, 'i'),
-        ArrayU32(b) => array!(b, u32, 'I'),
-        ArrayFloat(b) => array!(b, f32, 'f'),
-        _ => unreachable!(),
-    })
 }
 
-/// Decode SAM CIGAR operations using the indexed reader's parser.
-///
-/// Returns an empty vector for `*` and propagates seqair's parse errors.
+/// Append a decoded BAM value's SAM `:TYPE:VALUE` representation.
+fn write_aux(out: &mut Vec<u8>, value: AuxValue<'_>) -> Result<()> {
+    use AuxValue::*;
+    if let Some(n) = value.as_i64() {
+        out.extend_from_slice(b":i:");
+        out.extend_from_slice(itoa::Buffer::new().format(n).as_bytes());
+        return Ok(());
+    }
+    macro_rules! array {
+        ($bytes:expr, $typ:ty, $sub:literal) => {{
+            out.extend_from_slice(concat!(":B:", $sub).as_bytes());
+            for chunk in $bytes.chunks_exact(size_of::<$typ>()) {
+                write!(out, ",{}", <$typ>::from_le_bytes(chunk.try_into()?))?;
+            }
+        }};
+    }
+    match value {
+        Char(c) => out.extend_from_slice(&[b':', b'A', b':', c]),
+        Float(f) => write!(out, ":f:{f}")?,
+        Double(f) => write!(out, ":d:{f}")?,
+        String(v) => {
+            out.extend_from_slice(b":Z:");
+            out.extend_from_slice(v);
+        }
+        Hex(v) => {
+            out.extend_from_slice(b":H:");
+            out.extend_from_slice(v);
+        }
+        ArrayI8(b) => array!(b, i8, "c"),
+        ArrayU8(b) => array!(b, u8, "C"),
+        ArrayI16(b) => array!(b, i16, "s"),
+        ArrayU16(b) => array!(b, u16, "S"),
+        ArrayI32(b) => array!(b, i32, "i"),
+        ArrayU32(b) => array!(b, u32, "I"),
+        ArrayFloat(b) => array!(b, f32, "f"),
+        _ => unreachable!(),
+    }
+    Ok(())
+}
+
+/// Decode SAM CIGAR operations into `out` (cleared first) with the indexed
+/// reader's parser. `*` yields no operations; seqair's parse errors propagate.
 /// Recognizes `=`, `X` and `P`; ignoring them for r985 scoring is the caller's job.
-pub fn parse_cigar(text: &str) -> Result<Vec<CigarOp>> {
-    let mut out = Vec::new();
-    super::reader::parse_cigar(text.as_bytes(), &mut out)?;
-    Ok(out)
+pub fn parse_cigar_into(text: &[u8], out: &mut Vec<CigarOp>) -> Result<()> {
+    out.clear();
+    super::reader::parse_cigar(text, out)?;
+    Ok(())
 }
 
 /// Read a sequential BAM header through the existing seqair header decoder.
@@ -300,4 +637,242 @@ pub fn read_bam_header<R: std::io::Read + std::io::Seek>(
     reader: &mut bam::bgzf::BgzfReader<R>,
 ) -> Result<BamHeader> {
     Ok(BamHeader::parse(reader)?)
+}
+
+// ── Read-ahead BGZF decompression ───────────────────────────────────────
+
+/// BGZF blocks decompressed per job (about 1 MiB of BAM data).
+const BLOCKS_PER_JOB: usize = 16;
+
+/// Location of one block's DEFLATE payload within a job's compressed bytes.
+struct Frame {
+    start: usize,
+    end: usize,
+    crc: u32,
+    size: usize,
+}
+/// Several consecutive blocks for one worker; the reply preserves order.
+struct Job {
+    data: Vec<u8>,
+    frames: Vec<Frame>,
+    reply: mpsc::SyncSender<std::result::Result<Vec<u8>, BgzfError>>,
+}
+/// Decompressed data in stream order: ready now, or still on a worker.
+enum Pending {
+    Ready(std::result::Result<Vec<u8>, BgzfError>),
+    Waiting(mpsc::Receiver<std::result::Result<Vec<u8>, BgzfError>>),
+}
+/// Worker threads; dropping closes the job queue and joins them.
+struct Pool {
+    jobs: Option<mpsc::SyncSender<Job>>,
+    workers: Vec<thread::JoinHandle<()>>,
+}
+impl Drop for Pool {
+    fn drop(&mut self) {
+        drop(self.jobs.take());
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+}
+
+/// Forward-only decompressed BGZF stream with optional read-ahead workers.
+///
+/// Framing, CRC and size checks match [`bam::bgzf::BgzfReader`]: a partial
+/// final header or a zero-length block ends the stream, as in the sequential
+/// reader. With `threads == 0` blocks are inflated on the calling thread;
+/// otherwise up to `2 * threads` jobs are decompressed ahead in order. Errors are
+/// reported when the consumer reaches the failing block.
+pub struct BgzfStream<R: Read> {
+    inner: R,
+    current: Vec<u8>,
+    pos: usize,
+    pending: VecDeque<Pending>,
+    depth: usize,
+    exhausted: bool,
+    decompressor: libdeflater::Decompressor,
+    // Declared last so workers are joined after the queue has been drained.
+    pool: Option<Pool>,
+}
+impl<R: Read> BgzfStream<R> {
+    /// Continue a stream after `BgzfReader::into_parts`.
+    ///
+    /// `initial` is already decompressed data to return first; `ended` marks
+    /// that the source reader had already reached its end-of-stream block.
+    ///
+    /// # Errors
+    /// Returns an error if a worker thread cannot be started.
+    pub fn new(inner: R, initial: Vec<u8>, ended: bool, threads: usize) -> io::Result<Self> {
+        let pool = if threads == 0 {
+            None
+        } else {
+            let (jobs, queue) = mpsc::sync_channel::<Job>(threads * 2);
+            let queue = Arc::new(Mutex::new(queue));
+            let mut workers = Vec::with_capacity(threads);
+            for i in 0..threads {
+                let queue = Arc::clone(&queue);
+                workers.push(thread::Builder::new().name(format!("postalt-bgzf-{i}")).spawn(
+                    move || {
+                        let mut decompressor = libdeflater::Decompressor::new();
+                        loop {
+                            // Hold the lock only while waiting for the next job.
+                            let job = queue.lock().map(|q| q.recv());
+                            let Ok(Ok(job)) = job else { break };
+                            let _ =
+                                job.reply.send(inflate(&mut decompressor, &job.data, &job.frames));
+                        }
+                    },
+                )?);
+            }
+            Some(Pool { jobs: Some(jobs), workers })
+        };
+        Ok(Self {
+            inner,
+            current: initial,
+            pos: 0,
+            pending: VecDeque::new(),
+            depth: (threads * 2).max(1),
+            exhausted: ended,
+            decompressor: libdeflater::Decompressor::new(),
+            pool,
+        })
+    }
+
+    /// Queue jobs until the read-ahead depth is reached or input ends.
+    fn fill(&mut self) {
+        while !self.exhausted && self.pending.len() < self.depth {
+            let mut data = Vec::new();
+            let mut frames = Vec::with_capacity(BLOCKS_PER_JOB);
+            let mut failure = None;
+            while frames.len() < BLOCKS_PER_JOB {
+                match read_frame(&mut self.inner, &mut data) {
+                    Ok(Some(frame)) => frames.push(frame),
+                    Ok(None) => {
+                        self.exhausted = true;
+                        break;
+                    }
+                    Err(e) => {
+                        self.exhausted = true;
+                        failure = Some(e);
+                        break;
+                    }
+                }
+            }
+            if !frames.is_empty() {
+                let sender = self.pool.as_ref().and_then(|p| p.jobs.as_ref());
+                if let Some(sender) = sender {
+                    let (reply, receiver) = mpsc::sync_channel(1);
+                    match sender.send(Job { data, frames, reply }) {
+                        Ok(()) => self.pending.push_back(Pending::Waiting(receiver)),
+                        Err(mpsc::SendError(job)) => self.pending.push_back(Pending::Ready(
+                            inflate(&mut self.decompressor, &job.data, &job.frames),
+                        )),
+                    }
+                } else {
+                    let result = inflate(&mut self.decompressor, &data, &frames);
+                    self.pending.push_back(Pending::Ready(result));
+                }
+            }
+            if let Some(e) = failure {
+                self.pending.push_back(Pending::Ready(Err(e)));
+            }
+        }
+    }
+}
+impl<R: Read> Read for BgzfStream<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        while self.pos >= self.current.len() {
+            self.fill();
+            let Some(next) = self.pending.pop_front() else { return Ok(0) };
+            let data = match next {
+                Pending::Ready(result) => result,
+                Pending::Waiting(receiver) => receiver.recv().map_err(|_| {
+                    io::Error::other("a BGZF decompression worker stopped unexpectedly")
+                })?,
+            };
+            self.current = data.map_err(io::Error::other)?;
+            self.pos = 0;
+        }
+        let n = buf.len().min(self.current.len() - self.pos);
+        buf[..n].copy_from_slice(&self.current[self.pos..self.pos + n]);
+        self.pos += n;
+        Ok(n)
+    }
+}
+
+/// Read one BGZF block's framing, appending its DEFLATE payload to `data`.
+///
+/// Returns `None` at a clean or partial-header end, or at a zero-length block,
+/// exactly where `BgzfReader` stops.
+fn read_frame(
+    inner: &mut impl Read,
+    data: &mut Vec<u8>,
+) -> std::result::Result<Option<Frame>, BgzfError> {
+    let mut header = [0u8; 18];
+    match inner.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(_) => return Err(BgzfError::TruncatedBlock),
+    }
+    if header[..4] != [0x1f, 0x8b, 0x08, 0x04] {
+        return Err(BgzfError::InvalidMagic);
+    }
+    let xlen = usize::from(u16::from_le_bytes([header[10], header[11]]));
+    let bsize = if xlen == 6 && header[12..16] == [b'B', b'C', 2, 0] {
+        u16::from_le_bytes([header[16], header[17]])
+    } else {
+        // Non-standard extra fields, handled as in BgzfReader::read_block.
+        let already = 6usize.min(xlen);
+        let mut extra = header[12..12 + already].to_vec();
+        let start = extra.len();
+        extra.resize(xlen, 0);
+        inner.read_exact(&mut extra[start..]).map_err(|_| BgzfError::TruncatedBlock)?;
+        find_bsize(&extra).ok_or(BgzfError::MissingBsize)?
+    };
+    let remaining = (usize::from(bsize) + 1)
+        .checked_sub(12 + xlen)
+        .ok_or(BgzfError::BlockSizeTooSmall { bsize })?;
+    if remaining < 8 {
+        // Still consume the bytes so errors match the sequential reader.
+        let mut skip = vec![0; remaining];
+        inner.read_exact(&mut skip).map_err(|_| BgzfError::TruncatedBlock)?;
+        return Err(BgzfError::TruncatedBlock);
+    }
+    let start = data.len();
+    data.resize(start + remaining, 0);
+    inner.read_exact(&mut data[start..]).map_err(|_| BgzfError::TruncatedBlock)?;
+    let footer = start + remaining - 8;
+    let word = |at: usize| u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]);
+    let (crc, size) = (word(footer), word(footer + 4) as usize);
+    if size > 65536 {
+        return Err(BgzfError::UncompressedSizeTooLarge { isize_value: size });
+    }
+    if size == 0 {
+        data.truncate(start);
+        return Ok(None);
+    }
+    Ok(Some(Frame { start, end: footer, crc, size }))
+}
+
+/// Inflate and CRC-check consecutive blocks into one buffer.
+fn inflate(
+    decompressor: &mut libdeflater::Decompressor,
+    data: &[u8],
+    frames: &[Frame],
+) -> std::result::Result<Vec<u8>, BgzfError> {
+    let mut out = Vec::with_capacity(frames.iter().map(|f| f.size).sum());
+    for frame in frames {
+        let start = out.len();
+        out.resize(start + frame.size, 0);
+        let n = decompressor
+            .deflate_decompress(&data[frame.start..frame.end], &mut out[start..])
+            .map_err(|source| BgzfError::DecompressionFailed { source })?;
+        out.truncate(start + n);
+        let mut crc = libdeflater::Crc::new();
+        crc.update(&out[start..]);
+        if crc.sum() != frame.crc {
+            return Err(BgzfError::ChecksumMismatch { expected: frame.crc, found: crc.sum() });
+        }
+    }
+    Ok(out)
 }

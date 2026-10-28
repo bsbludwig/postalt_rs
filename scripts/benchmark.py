@@ -26,15 +26,21 @@ p.add_argument('--binary', default='target/release/postalt_rs')
 p.add_argument('--reference', default=os.environ.get('POSTALT_REFERENCE','/opt/apps/manual/bwa-mem2/2.3.0/noarch/bin/bwa-postalt.js'))
 p.add_argument('--k8', default=os.environ.get('K8','k8'))
 p.add_argument('--repeats', type=int, default=3)
+p.add_argument('--jobs', type=int, nargs='*', default=[0, 4], help='extra -j values to time')
+p.add_argument('--samtools', default='samtools', help='for a BAM copy baseline; empty to skip')
+p.add_argument('--skip-reference', action='store_true', help='do not time k8')
 p.add_argument('--json', type=Path, required=True)
 a = p.parse_args()
 if a.repeats < 1: p.error('--repeats must be positive')
-commands = {
-    'k8_sam': [a.k8,a.reference,a.alt,a.sam],
-    'rust_sam_compat': [a.binary,'--k8-1.2-compat',a.alt,a.sam],
-    'rust_sam_default': [a.binary,a.alt,a.sam],
-}
-if a.bam: commands['rust_bam_2_workers'] = [a.binary,'-O','bam','-@','2',a.alt,a.bam]
+commands = {} if a.skip_reference else {'k8_sam': [a.k8,a.reference,a.alt,a.sam]}
+commands['rust_sam_compat'] = [a.binary,'--k8-1.2-compat',a.alt,a.sam]
+commands['rust_sam_default'] = [a.binary,a.alt,a.sam]
+for j in a.jobs: commands[f'rust_sam_default_j{j}'] = [a.binary,'-j',str(j),a.alt,a.sam]
+if a.bam:
+    commands['rust_bam_2_workers'] = [a.binary,'-O','bam','-@','2',a.alt,a.bam]
+    for j in a.jobs: commands[f'rust_bam_j{j}_4_workers'] = [a.binary,'-j',str(j),'-O','bam','-@','4',a.alt,a.bam]
+    # Decompress/recompress-only baseline with the same number of workers.
+    if a.samtools: commands['samtools_bam_copy_4_workers'] = [a.samtools,'view','--no-PG','-@','4','-b',a.bam]
 result = {'platform': platform.platform(), 'reference_sha256': hashlib.sha256(Path(a.reference).read_bytes()).hexdigest(),
           'input_sam_bytes': Path(a.sam).stat().st_size, 'runs':{}, 'median':{}}
 with tempfile.TemporaryDirectory() as tmp:
@@ -53,7 +59,8 @@ with tempfile.TemporaryDirectory() as tmp:
         result['median'][name] = {k:statistics.median(r[k] for r in runs) for k in runs[0]}
 # Compare identical SAM input/output modes. The BAM row additionally performs
 # decompression/compression and is deliberately excluded from this speedup ratio.
-result['sam_speedup'] = result['median']['k8_sam']['wall_seconds']/result['median']['rust_sam_compat']['wall_seconds']
+if 'k8_sam' in result['median']:
+    result['sam_speedup'] = result['median']['k8_sam']['wall_seconds']/result['median']['rust_sam_compat']['wall_seconds']
 a.json.parent.mkdir(parents=True,exist_ok=True)
 a.json.write_text(json.dumps(result,indent=2)+'\n')
-print('SAM speedup:',result['sam_speedup'])
+if 'sam_speedup' in result: print('SAM speedup:',result['sam_speedup'])

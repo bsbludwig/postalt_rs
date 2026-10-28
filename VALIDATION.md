@@ -1,4 +1,4 @@
-# Validation record — 2026-10-27
+# Validation record — 2026-10-27, updated 2026-10-28
 
 Validated on the supplied BAM and ALT mapping file. Raw sample reads and large outputs stay under ignored `target/validation/`; checked-in fixtures are synthetic. Machine-readable timing and output hashes are in [validation/](validation/).
 
@@ -27,20 +27,43 @@ The k8 runtime has two relevant defects. Indexed `Bytes` access was removed in k
 
 ## Performance
 
-Host: AMD EPYC 9555P, Linux x86-64, glibc 2.34. Rust 1.98.1, release build with thin LTO and one codegen unit. Processing uses one thread; the BAM case uses two compression workers. No CPU affinity or exclusive host allocation was used.
+Host: AMD EPYC 9555P, Linux x86-64, glibc 2.34. Rust 1.98.1, release build with thin LTO and one codegen unit, mimalloc allocator. `-j` sets processing/decompression workers (default 1) and `-@` BAM compression workers. No CPU affinity or exclusive host allocation was used.
 
-Each row is the median of three sequential runs against the prepared input, discarding stdout to `/dev/null`. Input was already cached following correctness checks; no cold-cache claim is made. Startup, ALT-index construction and I/O are included. `/usr/bin/time` records wall/CPU time and peak RSS. Full individual measurements are in [benchmark.json](validation/benchmark.json).
+Each row is the median of three sequential runs against the prepared input, discarding stdout to `/dev/null`. Input was already cached following correctness checks; no cold-cache claim is made. Startup, ALT-index construction and I/O are included. `/usr/bin/time` records wall/CPU time and peak RSS. Full individual measurements are in [benchmark.json](validation/benchmark.json) (re-measured 2026-10-28).
 
-| Path | Wall time | Peak RSS |
-| --- | ---: | ---: |
-| k8 reference, SAM → SAM | 62.13 s | 109.12 MiB |
-| Rust installed-k8 mode, SAM → SAM | 4.85 s | 5.50 MiB |
-| Rust corrected default, SAM → SAM | 4.90 s | 5.50 MiB |
-| Rust corrected default, BAM → BAM, 2 workers | 9.79 s | 8.50 MiB |
+| Path | Wall time | CPU time | Peak RSS |
+| --- | ---: | ---: | ---: |
+| k8 reference, SAM → SAM | 62.24 s | 62.62 s | 109.7 MiB |
+| Rust installed-k8 mode, SAM → SAM (`-j 1`) | 1.67 s | 1.86 s | 46.3 MiB |
+| Rust corrected default, SAM → SAM (`-j 1`) | 1.66 s | 1.85 s | 48.3 MiB |
+| Rust corrected default, SAM → SAM, `-j 0` | 1.83 s | 1.82 s | 26.3 MiB |
+| Rust corrected default, SAM → SAM, `-j 4` | 0.50 s | 2.12 s | 88.4 MiB |
+| Rust BAM → BAM, `-j 1 -@ 2` | 3.72 s | 11.35 s | 72.4 MiB |
+| Rust BAM → BAM, `-j 4 -@ 4` | 1.70 s | 11.86 s | 130.5 MiB |
+| `samtools view -b -@ 4` (copy only, for scale) | 2.12 s | 8.52 s | 8.5 MiB |
 
-On this workload, SAM processing is **12.8× faster** in compatibility mode, or **12.7× faster** with corrected reversal. These are dataset- and hardware-specific measurements. The BAM row includes decompression and compression and should not be interpreted as an identical-I/O comparison to the SAM rows.
+On this workload, SAM processing is **37× faster** than k8 with the default single processing worker. The BAM rows include decompression and compression and should not be compared directly with the SAM rows.
 
-The initial correctness runs writing full outputs to disk took 64.52 s for k8, 5.58 s for Rust compatibility mode, 5.75 s for corrected default, and 9.84 s for BAM → BAM. They are separate from the repeated `/dev/null` measurements.
+### Optimization of 2026-10-28
+
+The ALT-rich dataset above is about 85% XA records, unlike whole-genome data, where most reads pass through unchanged. A second, pass-through-heavy dataset was prepared from the same BAM with `prepare_real_data.py --regions chr1:100000000-115000000`: 2,893,003 records (1.98 GB SAM), 5% with XA tags.
+
+Profiling the previous build showed about 40% of time in glibc malloc/free (one heap string per SAM field), and BAM records went through a full BAM → text → BAM round trip. The optimized build keeps each record in one reused buffer, keeps BAM records in wire form unless they change, skips hit parsing for records that cannot involve an ALT contig, uses mimalloc, and processes batches of whole read-end groups in parallel, writing them in input order.
+
+Equivalence: on both datasets, output was byte-identical to the previous build for SAM → SAM (both reversal modes), BAM → SAM, and samtools-normalized BAM → BAM and SAM → BAM, at `-j 0`, `1`, `4` and `8`. Truncated BAM input, an invalid FLAG and a malformed XA tag mid-stream produced identical partial output and messages. `validate_real.py` passed with hashes identical to [real-validation.json](validation/real-validation.json). The k8 differential suite (49 cases and 10,000 randomized templates, both modes) passed at `-j 0`, `1` and `4`. Rust tests: 4 unit, 62 integration (golden cases at several `-j` values, multi-batch streams, error semantics) and 1 doctest.
+
+Old versus new build, median of three warm runs (full data in [optimization-benchmark.json](validation/optimization-benchmark.json)):
+
+| Dataset | Path | Old | New | Peak RSS old → new |
+| --- | --- | ---: | ---: | ---: |
+| pass-through | SAM → SAM | 2.91 s | 0.83 s (`-j 1`), 0.45 s (`-j 8`) | 6 → 35 / 89 MiB |
+| pass-through | BAM → SAM | 5.22 s | 2.73 s (`-j 0`), 0.44 s (`-j 4`) | 7 → 55 / 115 MiB |
+| pass-through | BAM → BAM, `-@ 4` | 8.52 s | 2.36 s (`-j 4`); samtools copy 4.29 s | 9 → 108 MiB |
+| pass-through | BAM → BAM, `-@ 8` | — | 1.20 s (`-j 4`); samtools copy 2.18 s | 133 MiB |
+| ALT-rich | SAM → SAM | 4.97 s | 1.68 s (`-j 1`), 0.30 s (`-j 8`) | 6 → 49 / 139 MiB |
+| ALT-rich | BAM → BAM, `-@ 4` | 9.93 s | 1.70 s (`-j 4`); samtools copy 2.12 s | 10 → 125 MiB |
+
+Higher memory use comes from the batches in flight (at most `2 × jobs + 2`, about 512 KiB of input each) and per-thread allocator caches. It is bounded and does not grow with input size.
 
 ## Reproduce
 

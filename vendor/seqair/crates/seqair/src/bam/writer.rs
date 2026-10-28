@@ -119,41 +119,43 @@ impl<W: Write> BamWriter<W> {
         Ok(Self { bgzf, index, buf: Vec::with_capacity(512), poisoned: false })
     }
 
-    /// Write the local streaming adapter's SAM record with full BAM IUPAC bases.
+    /// Write already-serialized BAM records: each a little-endian `block_size`
+    /// followed by that many payload bytes (postalt extension).
     ///
-    /// This postalt extension first uses the existing owned encoder, then replaces
-    /// its five-base sequence with the original text's encoded IUPAC nibbles.
-    /// BAM output retains values rather than original SAM lexical spelling.
-    /// `header` must be the dictionary used to construct this writer.
+    /// Payloads are emitted unchanged, so records kept in wire form need no
+    /// decode/encode round trip. `header` must be the dictionary used to
+    /// construct this writer; it is consulted only when building an index.
     ///
     /// # Errors
-    /// Returns conversion/encoding errors or BGZF/index write failures. A failure
-    /// during finalization poisons the writer; errors before finalization have not
-    /// emitted this record. Call `finish` afterward to observe buffered errors.
-    pub fn write_sam_record(
+    /// Returns framing/size errors, or BGZF/index write failures (which poison
+    /// the writer). Records before a failing one have already been written.
+    pub fn write_bam_records(
         &mut self,
-        record: &crate::sam::stream::SamRecord,
+        mut data: &[u8],
         header: &BamHeader,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if self.poisoned {
             return Err(BamWriteError::Poisoned.into());
         }
-        let owned = record.to_owned_bam(header)?;
-        self.buf.clear();
-        owned.to_bam_bytes(&mut self.buf)?;
-        if record.fields[9] != "*" {
-            // Fixed BAM fields (32 bytes), NUL-terminated QNAME, then packed
-            // CIGAR operations (4 bytes each) precede the sequence. Replacing
-            // equally sized nibbles preserves all downstream byte offsets.
-            let offset = 32 + owned.qname.len() + 1 + owned.cigar.len() * 4;
-            let packed = super::seq::encode_seq(record.fields[9].to_ascii_uppercase().as_bytes());
-            self.buf[offset..offset + packed.len()].copy_from_slice(&packed);
+        while let Some((size, rest)) = data.split_first_chunk::<4>() {
+            let size = usize::try_from(i32::from_le_bytes(*size))
+                .map_err(|_| "negative serialized BAM record size")?;
+            let payload = rest.get(..size).ok_or("truncated serialized BAM record")?;
+            data = rest.get(size..).unwrap_or_default();
+            let (tid, unmapped, beg, end) = if self.index.is_some() {
+                index_fields(payload, header)?
+            } else {
+                (None, true, 0, 0)
+            };
+            self.buf.clear();
+            self.buf.extend_from_slice(payload);
+            if let Err(e) = self.finalize_record(tid, unmapped, beg, end) {
+                self.poisoned = true;
+                return Err(e.into());
+            }
         }
-        let beg = owned.pos.map(seqair_types::Pos0::as_u64).unwrap_or(0);
-        let end = owned.end_pos().map(|p| p.as_u64()).unwrap_or(beg);
-        if let Err(e) = self.finalize_record(owned.tid, owned.flags.is_unmapped(), beg, end) {
-            self.poisoned = true;
-            return Err(e.into());
+        if !data.is_empty() {
+            return Err("truncated serialized BAM record size".into());
         }
         Ok(())
     }
@@ -572,6 +574,24 @@ fn write_bam_header<W: Write>(
 
     bgzf.write_all(&buf)?;
     Ok(())
+}
+
+/// BAI inputs of a serialized payload: reference, unmapped flag, begin and end.
+fn index_fields(
+    payload: &[u8],
+    header: &BamHeader,
+) -> Result<(Option<Tid>, bool, u64, u64), Box<dyn std::error::Error + Send + Sync>> {
+    let word = |at: usize| -> Result<i32, &'static str> {
+        let bytes = payload.get(at..at + 4).ok_or("truncated BAM record")?;
+        Ok(i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    };
+    let tid = Tid::from_wire(word(0)?, header)?;
+    let flags = payload.get(14..16).ok_or("truncated BAM record")?;
+    let unmapped = u16::from_le_bytes([flags[0], flags[1]]) & 4 != 0;
+    let beg = u64::try_from(word(4)?).unwrap_or(0);
+    let end = super::record::compute_end_pos_from_raw(payload)
+        .map_or(beg, |p| p.as_u64().saturating_add(1));
+    Ok((tid, unmapped, beg, end))
 }
 
 #[cfg(test)]

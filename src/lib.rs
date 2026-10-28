@@ -20,29 +20,27 @@
 //! # Streaming lifecycle
 //!
 //! Keep records contiguous by read name **and** read end, in aligner order.
-//! Flush before pushing a different group, and again at EOF. Finalize both the
-//! HLA writers and alignment output explicitly so buffered I/O errors propagate.
+//! [`pipeline::run`] reads whole groups in batches, processes them on worker
+//! threads and writes results in input order; [`postalt::Processor`] can also be
+//! driven directly. Finalize the HLA writers and alignment output explicitly so
+//! buffered I/O errors propagate.
 //!
 //! ```no_run
-//! use postalt_rs::{io::{Input, Output}, postalt::{AltIndex, Processor}};
-//! use std::path::Path;
+//! use postalt_rs::{io::{Input, Output}, pipeline::{self, Settings, Worker}, postalt::AltIndex};
+//! use std::{path::Path, sync::Arc};
 //!
 //! # fn main() -> anyhow::Result<()> {
-//! let index = AltIndex::from_path(Path::new("reference.fa.alt"))?;
-//! let mut input = Input::open(None)?; // stdin
+//! let index = Arc::new(AltIndex::from_path(Path::new("reference.fa.alt"))?);
+//! let input = Input::open(None, 1)?; // stdin, one BAM decompression worker
 //! let mut output = Output::create(None, false, input.header_text(), 1, 6)?;
-//! let mut processor = Processor::new(index, 1.0, None)?;
-//! while let Some(record) = input.next_record()? {
-//!     if processor.starts_new_group(&record) {
-//!         processor.flush(|r| output.write(r))?;
-//!     }
-//!     processor.push(record)?;
-//! }
-//! processor.flush(|r| output.write(r))?;
-//! processor.finish_fastq()?;
+//! let settings = Settings { ratio: 1.0, k8_compat: false, fastq: false };
+//! let headers = (input.bam_header().cloned(), output.bam_header().cloned());
+//! let make = || Worker::new(Arc::clone(&index), &settings, headers.0.clone(), headers.1.clone());
+//! pipeline::run(input, &mut output, &mut [], 2, make)?;
 //! output.finish()?;
 //! # Ok(())
 //! # }
 //! ```
 pub mod io;
+pub mod pipeline;
 pub mod postalt;
