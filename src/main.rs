@@ -34,7 +34,7 @@ Input defaults to stdin; output defaults to SAM on stdout.\n\n\
   -o, --output FILE      Output path (- for stdout)\n\
   -O, --output-format F  sam or bam (default sam)\n\
   -@, --threads INT      BAM compression workers (default 1)\n\
-  -j, --jobs INT         Processing and BAM decompression workers (default 1;\n\
+  -j, --jobs INT         Processing and BGZF decompression workers (default 1;\n\
                          0 runs everything on one thread)\n\
   --k8-1.2-compat        Reproduce installed k8's unchanged reverse sequences\n\
   --compression INT     BAM compression level 0..12 (default 6)\n\
@@ -48,7 +48,7 @@ Input defaults to stdin; output defaults to SAM on stdout.\n\n\
 fn run() -> Result<()> {
     let mut args = std::env::args().skip(1).peekable();
     let mut prefix = None;
-    let mut ratio = 1.0;
+    let mut ratio: f64 = 1.0;
     let mut output: Option<PathBuf> = None;
     let mut k8_compat = false;
     let mut bam = false;
@@ -81,7 +81,7 @@ fn run() -> Result<()> {
             }
             "--k8-1.2-compat" => k8_compat = true,
             "-p" => prefix = Some(value()?),
-            "-r" => ratio = value()?.parse::<f64>()?,
+            "-r" => ratio = parse_option(&arg, &value()?)?,
             "-o" | "--output" => output = Some(value()?.into()),
             "-O" | "--output-format" => {
                 bam = match value()?.as_str() {
@@ -90,14 +90,14 @@ fn run() -> Result<()> {
                     f => bail!("unsupported output format {f}"),
                 };
             }
-            "-@" | "--threads" => threads = value()?.parse()?,
-            "-j" | "--jobs" => jobs = value()?.parse()?,
-            "--compression" => compression = value()?.parse()?,
+            "-@" | "--threads" => threads = parse_option(&arg, &value()?)?,
+            "-j" | "--jobs" => jobs = parse_option(&arg, &value()?)?,
+            "--compression" => compression = parse_option(&arg, &value()?)?,
             "--" => {
                 positional.extend(args);
                 break;
             }
-            _ if arg.starts_with("-r") && arg.len() > 2 => ratio = arg[2..].parse()?,
+            _ if arg.starts_with("-r") && arg.len() > 2 => ratio = parse_option("-r", &arg[2..])?,
             _ if arg.starts_with("-p") && arg.len() > 2 => prefix = Some(arg[2..].into()),
             _ if arg.starts_with('-') && arg != "-" => bail!("unknown option {arg}"),
             _ => positional.push(arg),
@@ -115,30 +115,52 @@ fn run() -> Result<()> {
     if !ratio.is_finite() {
         bail!("-r must be a finite number");
     }
-    if threads == 0 {
-        bail!("threads must be at least 1");
+    if !(1..=MAX_THREADS).contains(&threads) {
+        bail!("threads must be between 1 and {MAX_THREADS}");
+    }
+    if jobs > MAX_THREADS {
+        bail!("jobs must be at most {MAX_THREADS}");
     }
     if !(0..=12).contains(&compression) {
         bail!("compression must be between 0 and 12");
     }
-    // Explicit output paths are an extension to the stdout-only script. Guard
-    // identical paths and resolvable symlink aliases before File::create truncates.
-    // Stdin ("-") cannot alias a file, and inputs that cannot be resolved are
-    // left for the open below to report.
-    if let Some(out) = output.as_deref().filter(|p| *p != Path::new("-")) {
-        for input in positional.iter().filter(|p| *p != "-") {
-            let same = out == Path::new(input)
-                || (out.exists()
-                    && matches!(
-                        (std::fs::canonicalize(out), std::fs::canonicalize(input)),
-                        (Ok(a), Ok(b)) if a == b
-                    ));
-            if same {
-                bail!("output must not overwrite an input file");
+    let index = Arc::new(AltIndex::from_path(Path::new(&positional[0]))?);
+    // The FASTQ files are created (truncated) too: none may alias the output
+    // or an input.
+    let fastq_paths: Vec<String> = match prefix.as_deref().filter(|x| !x.is_empty()) {
+        Some(prefix) => index
+            .hla_genes()
+            .iter()
+            .map(|gene| format!("{prefix}.{gene}.fq"))
+            .collect(),
+        None => Vec::new(),
+    };
+    let created: Vec<(&str, &Path)> = output
+        .as_deref()
+        .filter(|p| *p != Path::new("-"))
+        .map(|p| ("output", p))
+        .into_iter()
+        .chain(
+            fastq_paths
+                .iter()
+                .map(|p| ("HLA FASTQ output", Path::new(p))),
+        )
+        .collect();
+    let inputs = positional
+        .iter()
+        .filter(|p| *p != "-")
+        .map(|p| ("input", Path::new(p)));
+    for (i, &(role, path)) in created.iter().enumerate() {
+        for (other, existing) in inputs.clone().chain(created[..i].iter().copied()) {
+            if same_file(path, existing) {
+                bail!(
+                    "{role} {} is also the {other} {}",
+                    path.display(),
+                    existing.display()
+                );
             }
         }
     }
-    let index = Arc::new(AltIndex::from_path(Path::new(&positional[0]))?);
     let input = Input::open(positional.get(1).map(Path::new), jobs)?;
     let mut out = Output::create(
         output.as_deref(),
@@ -150,12 +172,9 @@ fn run() -> Result<()> {
     // A nonempty prefix creates/truncates `<prefix>.<gene>.fq` even if no reads
     // eventually match that gene. Files already created are not rolled back.
     let mut fastq = Vec::new();
-    if let Some(prefix) = prefix.filter(|x| !x.is_empty()) {
-        for gene in index.hla_genes() {
-            let path = format!("{prefix}.{gene}.fq");
-            let file = File::create(&path).with_context(|| format!("create {path}"))?;
-            fastq.push(BufWriter::new(file));
-        }
+    for path in &fastq_paths {
+        let file = File::create(path).with_context(|| format!("create {path}"))?;
+        fastq.push(BufWriter::new(file));
     }
     let settings = Settings {
         ratio,
@@ -175,6 +194,31 @@ fn run() -> Result<()> {
     }
     out.finish()
 }
+/// Most worker or compression threads accepted; more only exhausts the system.
+const MAX_THREADS: usize = 1024;
+
+/// Parse an option's value, naming the option on failure.
+fn parse_option<T>(option: &str, value: &str) -> Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::error::Error + Send + Sync + 'static,
+{
+    value
+        .parse()
+        .with_context(|| format!("invalid value {value:?} for {option}"))
+}
+
+/// Whether two paths name the same file: identical, or resolving to the same
+/// existing file (symlinks). A path that does not exist yet aliases only
+/// itself.
+fn same_file(a: &Path, b: &Path) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(x), Ok(y)) if x == y
+        )
+}
+
 /// Report processing failures, treating a downstream closed pipe as completion.
 fn main() -> std::process::ExitCode {
     match run() {

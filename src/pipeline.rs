@@ -13,10 +13,10 @@
 //! Errors keep sequential semantics: everything emitted before the failing
 //! record is written, and a group is written only if sequential processing
 //! would have flushed it (see [`Processed::tail`]).
-use crate::io::{Batch, Format, Input, Output, Record, Serializer};
+use crate::io::{Batch, Format, Input, Output, Record, Serializer, is_header_line};
 use crate::postalt::{AltIndex, Processor};
 use anyhow::{Context, Result, anyhow};
-use seqair::bam::BamHeader;
+use seqair::bam::{BamHeader, RawBamRecord};
 use std::{
     collections::BTreeMap,
     fs::File,
@@ -61,6 +61,11 @@ impl Buffers {
     /// Return a buffer for reuse.
     pub fn give(&self, mut buffer: Vec<u8>) {
         buffer.clear();
+        // One huge group must not keep its allocation resident for the rest of
+        // the run.
+        if buffer.capacity() > 4 * Self::CAPACITY {
+            buffer.shrink_to(Self::CAPACITY);
+        }
         if let Ok(mut spare) = self.0.lock()
             && spare.len() < Self::LIMIT
         {
@@ -159,6 +164,16 @@ impl Worker {
         let mut error = None;
         for (i, bytes) in batch.records().enumerate() {
             let number = batch.first + i as u64;
+            // r985 prints a header line wherever it appears, at once, while the
+            // current group is still buffered.
+            if is_header_line(batch.format, bytes) {
+                first_ok |= i == 0;
+                if let Err(e) = self.serializer.write_header_line(bytes, &mut body.records) {
+                    error = Some(e.context(format!("SAM line {number}")));
+                    break;
+                }
+                continue;
+            }
             let record = match self.parse(batch.format, bytes) {
                 Ok(record) => record,
                 Err(e) => {
@@ -211,19 +226,16 @@ impl Worker {
         match format {
             Format::Sam => {
                 let mut record = self.processor.spare_sam();
-                record
-                    .parse_into(bytes)
-                    .map_err(anyhow::Error::from_boxed)?;
+                record.parse_into(bytes)?;
                 Ok(Record::Sam(record))
             }
             Format::Bam => {
                 let header = self.header.as_deref().context("BAM batch without header")?;
-                let mut record = self.processor.spare_bam();
-                let buffer = record.buffer_mut();
+                // Reuse a spare record's allocation for this payload.
+                let mut buffer = self.processor.spare_bam().into_payload();
                 buffer.clear();
                 buffer.extend_from_slice(bytes);
-                record.validate(header).map_err(anyhow::Error::from_boxed)?;
-                Ok(Record::Bam(record))
+                Ok(Record::Bam(RawBamRecord::from_payload(buffer, header)?))
             }
         }
     }

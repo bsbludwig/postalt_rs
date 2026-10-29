@@ -39,12 +39,3 @@ pass-through, allocation reuse and the mimalloc allocator; output is unchanged.
 Preserved quirks and intentional differences are described in [README.md](README.md)
 and the source comments. Test-only reference repairs are documented in
 `scripts/compatibility.py`; they do not modify the installed script.
-
-## Vendored dependency
-
-The upstream seqair code is by Pascal Hertleif and retains its original
-[MIT](vendor/seqair/LICENSE-MIT) and
-[Apache-2.0](vendor/seqair/LICENSE-APACHE) license notices. Its provenance and
-local streaming additions are documented in
-[POSTALT_PATCHES.md](vendor/seqair/POSTALT_PATCHES.md). The project's GPL license
-does not replace the upstream dependency's notices.

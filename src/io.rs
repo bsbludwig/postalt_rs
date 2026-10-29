@@ -16,18 +16,21 @@
 //! Format detection replays bytes consumed while sniffing, so pipes work without
 //! seeking. Neither input nor output sorts records or adds program/header lines.
 //! Call [`Output::finish`] to observe compression and buffered-write errors.
+use crate::sam_text::SamRecord;
 use anyhow::{Context, Result, bail};
 use seqair::{
     bam::{
-        BamHeader,
-        bgzf::BgzfReader,
+        BamHeader, RawBamRecord,
+        bgzf::{BgzfStream, EofMarker},
+        stream::BamStreamReader,
         writer::{BamWriter, BamWriterBuilder},
     },
-    sam::stream::{BamEncoder, BamRecord, BgzfStream, MAX_BAM_RECORD, SamRecord, read_bam_header},
+    sam::{SamRecordEncoder, format},
 };
 use std::{
     fs::File,
-    io::{self, BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write},
+    io::{self, BufRead, BufReader, BufWriter, Read, Write},
+    num::NonZeroU8,
     path::Path,
     sync::Arc,
 };
@@ -37,8 +40,8 @@ use std::{
 pub enum Record {
     /// Parsed SAM text (SAM input, generated hits, or decoded BAM).
     Sam(SamRecord),
-    /// Validated BAM payload that has not needed decoding.
-    Bam(BamRecord),
+    /// Validated BAM record that has not needed decoding.
+    Bam(RawBamRecord),
 }
 impl Record {
     /// QNAME bytes.
@@ -52,7 +55,7 @@ impl Record {
     pub fn flag(&self) -> u16 {
         match self {
             Self::Sam(r) => r.flag(),
-            Self::Bam(r) => r.flag(),
+            Self::Bam(r) => r.flags().raw(),
         }
     }
 }
@@ -89,18 +92,18 @@ impl Batch {
         let mut rest = &self.data[..];
         let format = self.format;
         std::iter::from_fn(move || {
-            if rest.is_empty() {
-                return None;
-            }
             let (record, tail) = match format {
                 Format::Sam => {
+                    if rest.is_empty() {
+                        return None;
+                    }
                     let end = memchr::memchr(b'\n', rest).unwrap_or(rest.len());
                     (&rest[..end], rest.get(end + 1..).unwrap_or_default())
                 }
+                // Input framed every record with a size it checked.
                 Format::Bam => {
-                    // Input framed every record with a validated size.
-                    let size = i32::from_le_bytes(rest[..4].try_into().unwrap()) as usize;
-                    (&rest[4..4 + size], &rest[4 + size..])
+                    let (size, rest) = rest.split_first_chunk::<4>()?;
+                    rest.split_at_checked(u32::from_le_bytes(*size) as usize)?
                 }
             };
             rest = tail;
@@ -130,38 +133,11 @@ fn group_key(format: Format, record: &[u8]) -> Option<(&[u8], u16)> {
     }
 }
 
-/// Adapt a forward-only reader to seqair's offset-tracking `Read + Seek` API.
-///
-/// Only position queries and seeks to the current offset succeed. Actual
-/// repositioning returns `Unsupported`; this is sufficient for sequential BGZF
-/// decoding and avoids materializing stdin merely to satisfy a `Seek` bound.
-pub struct ForwardReader<R> {
-    inner: R,
-    offset: u64,
-}
-impl<R: Read> Read for ForwardReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let n = self.inner.read(buf)?;
-        self.offset += n as u64;
-        Ok(n)
-    }
-}
-impl<R> Seek for ForwardReader<R> {
-    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
-        match from {
-            SeekFrom::Current(0) => Ok(self.offset),
-            SeekFrom::Start(n) if n == self.offset => Ok(n),
-            _ => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "input stream cannot seek",
-            )),
-        }
-    }
-}
 /// Buffered file/stdin/replayed stream shared by both input formats.
 type InputStream = BufReader<Box<dyn Read + Send>>;
-/// Decompressed BAM records after the header.
-type BamStream = BgzfStream<BufReader<ForwardReader<InputStream>>>;
+/// SAM text: plain or gzip text behind a [`BufReader`], or a [`BgzfStream`],
+/// which buffers its own inflated blocks.
+type TextStream = Box<dyn BufRead + Send>;
 
 /// Alignment input whose header has already been consumed.
 ///
@@ -187,25 +163,30 @@ enum Source {
     /// Plain or decompressed SAM text, with original leading header lines.
     Sam {
         /// Buffered text after any format-detection replay/decompression.
-        reader: InputStream,
+        reader: TextStream,
         /// First nonheader line read during header detection, if any.
         pending: Option<Vec<u8>>,
         /// Leading header text with line endings normalized to LF.
-        header: String,
+        header: Vec<u8>,
     },
     /// Sequential BGZF BAM decoded through seqair.
     Bam {
-        /// Decompressed record stream, possibly with read-ahead workers.
-        reader: Box<BamStream>,
-        /// Reference dictionary and original header text from the BAM header.
+        /// Record framing over the decompressed stream, possibly with
+        /// read-ahead workers.
+        reader: Box<BamStreamReader<InputStream>>,
+        /// Reference dictionary of the BAM header.
         header: Arc<BamHeader>,
+        /// The header as SAM text, as `samtools view -h` prints it: cut at its
+        /// first NUL and newline-terminated.
+        text: Vec<u8>,
     },
 }
 impl Input {
     /// Open a path, or stdin when `path` is `None` or `-`, and read its header.
     ///
-    /// `threads` read-ahead workers decompress BAM input (zero decompresses on
-    /// the reading thread); SAM input ignores it.
+    /// BAM and bgzipped SAM are inflated on rayon's global pool, up to `threads`
+    /// batches of blocks at once (zero inflates on the reading thread); plain
+    /// and (non-BGZF) gzip SAM ignore it.
     ///
     /// # Errors
     /// Returns open errors or the detection/header errors of [`Self::from_reader`].
@@ -228,22 +209,20 @@ impl Input {
     /// errors, or a failure to start decompression workers. Reading can block
     /// until sufficient bytes arrive to identify the format.
     pub fn from_reader(mut reader: Box<dyn Read + Send>, threads: usize) -> Result<Self> {
-        // Read both magic bytes explicitly: fill_buf() may return only one byte
+        // Read the magic bytes explicitly: fill_buf() may return only one byte
         // on a pipe. Treating that as plain SAM would misclassify a valid BAM.
-        let mut prefix = [0u8; 2];
-        let mut used = 0;
-        while used < prefix.len() {
-            let n = reader.read(&mut prefix[used..])?;
-            if n == 0 {
-                break;
-            }
-            used += n;
+        let prefix = read_prefix(&mut reader, 4)?;
+        let gzip = prefix.starts_with(&[31, 139]);
+        if prefix == b"CRAM" {
+            bail!("CRAM input is not supported; convert it with `samtools view -b`");
         }
-        let gzip = used == 2 && prefix == [31, 139];
-        let reader: Box<dyn Read + Send> =
-            Box::new(std::io::Cursor::new(prefix[..used].to_vec()).chain(reader));
+        if prefix == b"BAM\x01" {
+            bail!("uncompressed BAM input is not supported; compress it with `samtools view -b`");
+        }
+        let reader: Box<dyn Read + Send> = Box::new(io::Cursor::new(prefix).chain(reader));
         let mut reader = BufReader::with_capacity(256 * 1024, reader);
         let mut is_bam = false;
+        let mut is_bgzf = false;
         if gzip {
             // Inspect decompressed magic without assuming a seekable stream or
             // relying on the filename. Replay consumed compressed bytes to seqair.
@@ -252,45 +231,50 @@ impl Input {
                 reader: &mut reader,
                 copy: &mut consumed,
             };
-            let mut decoder = flate2::read::MultiGzDecoder::new(&mut tee);
-            let mut magic = [0u8; 4];
-            let mut n = 0;
-            while n < 4 {
-                let got = decoder.read(&mut magic[n..])?;
-                if got == 0 {
-                    break;
-                }
-                n += got;
-            }
-            if n == 4 && magic == *b"BAM\x01" {
-                is_bam = true;
-            }
-            let replay = std::io::Cursor::new(consumed).chain(reader);
-            let source: Box<dyn Read + Send> = if is_bam {
+            let magic = read_prefix(&mut flate2::read::MultiGzDecoder::new(&mut tee), 4)?;
+            is_bam = magic == b"BAM\x01";
+            // htslib's BGZF test: FEXTRA set and a `BC` first subfield.
+            is_bgzf = consumed.get(3).is_some_and(|flags| flags & 4 != 0)
+                && consumed.get(12..16) == Some(b"BC\x02\x00");
+            let replay = io::Cursor::new(consumed).chain(reader);
+            let source: Box<dyn Read + Send> = if is_bam || is_bgzf {
                 Box::new(replay)
             } else {
                 Box::new(flate2::read::MultiGzDecoder::new(replay))
             };
             reader = BufReader::with_capacity(256 * 1024, source);
         }
+        // Decompression shares rayon's global pool; `threads` bounds how many
+        // batches it inflates at once (255 at most).
+        let bgzf = |reader| {
+            let builder = BgzfStream::builder(reader);
+            match NonZeroU8::new(u8::try_from(threads).unwrap_or(u8::MAX)) {
+                Some(n) => builder.threads(n),
+                None => builder,
+            }
+        };
         let mut number = 0;
         let source = if is_bam {
-            let mut reader = BgzfReader::from_reader(ForwardReader {
-                inner: reader,
-                offset: 0,
-            });
-            let header = read_bam_header(&mut reader)
-                .map_err(anyhow::Error::from_boxed)
-                .context("read BAM header")?;
-            // Hand the rest of the stream, including any already-decompressed
-            // remainder of the header's last block, to the read-ahead decoder.
-            let (rest, inner, ended) = reader.into_parts();
+            let reader =
+                BamStreamReader::from_bgzf(bgzf(reader).build()).context("read BAM header")?;
+            let header = Arc::new(reader.header().clone());
+            let mut text = Vec::new();
+            format::format_sam_header(&header, &mut text).context("BAM header text")?;
             Source::Bam {
-                reader: Box::new(BgzfStream::new(inner, rest, ended, threads)?),
-                header: Arc::new(header),
+                reader: Box::new(reader),
+                header,
+                text,
             }
         } else {
-            let mut header = String::new();
+            // Bgzipped SAM inflates in parallel, unlike plain gzip. The EOF
+            // marker stays optional, as it was when every gzip SAM went
+            // through `MultiGzDecoder`.
+            let mut reader: TextStream = if is_bgzf {
+                Box::new(bgzf(reader).eof_marker(EofMarker::Optional).build())
+            } else {
+                Box::new(reader)
+            };
+            let mut header = Vec::new();
             let mut line = Vec::new();
             loop {
                 line.clear();
@@ -301,15 +285,21 @@ impl Input {
                 // Preserve the supplied k8 readline()>0 loop: a final line
                 // without a delimiter is omitted, even if it is a header.
                 if !line.ends_with(b"\n") {
+                    warn_stop(number, "its last line has no newline");
                     line.clear();
                     break;
                 }
                 if !line.starts_with(b"@") {
                     break;
                 }
-                let text = std::str::from_utf8(&line).context("SAM header is not UTF-8")?;
-                header.push_str(text.trim_end_matches(['\r', '\n']));
-                header.push('\n');
+                // Any bytes are kept (k8 does not decode); BAM output checks
+                // UTF-8 when it needs a dictionary.
+                let end = line
+                    .iter()
+                    .rposition(|&b| b != b'\r' && b != b'\n')
+                    .map_or(0, |i| i + 1);
+                header.extend_from_slice(&line[..end]);
+                header.push(b'\n');
             }
             // Header detection has already read the first alignment; retain it
             // rather than requiring a seek back to its start.
@@ -330,11 +320,13 @@ impl Input {
         })
     }
     /// Return the leading header without adding @PG records or changing sort order.
-    /// SAM CRLF endings are normalized to LF; headerless input returns an empty str.
-    pub fn header_text(&self) -> &str {
+    /// SAM CRLF endings are normalized to LF; headerless input returns no bytes.
+    /// A BAM header is returned as `samtools view -h` prints it: up to its first
+    /// NUL, newline-terminated, with `@SQ` lines generated if the text has none.
+    pub fn header_text(&self) -> &[u8] {
         match &self.source {
             Source::Sam { header, .. } => header,
-            Source::Bam { header, .. } => header.header_text(),
+            Source::Bam { text, .. } => text,
         }
     }
     /// The BAM reference dictionary that [`Record::Bam`] values refer to.
@@ -381,38 +373,30 @@ impl Input {
                 // Keep both of the reference runtime's stopping conditions;
                 // do not silently turn a blank line into a skipped record.
                 let line = &buf[start..];
-                if !line.ends_with(b"\n") || line.iter().all(|&b| b == b'\r' || b == b'\n') {
+                let unterminated = !line.ends_with(b"\n");
+                if unterminated || line.iter().all(|&b| b == b'\r' || b == b'\n') {
+                    let more = !unterminated && !reader.fill_buf()?.is_empty();
+                    if unterminated {
+                        warn_stop(self.number, "its last line has no newline");
+                    } else if more {
+                        warn_stop(self.number, "it is blank");
+                    }
                     buf.truncate(start);
                     self.done = true;
                     return Ok(false);
                 }
             }
             Source::Bam { reader, .. } => {
-                let mut size = [0u8; 4];
-                // EOF before the first size byte is normal. EOF partway through
-                // a size prefix or payload must instead report truncation.
-                let n = loop {
-                    match reader.read(&mut size) {
-                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                        result => break result?,
-                    }
-                };
-                if n == 0 {
+                // The size prefix is filled in once the payload is read.
+                buf.extend_from_slice(&[0; 4]);
+                if !reader.read_payload_into(buf)? {
+                    buf.truncate(start);
                     self.done = true;
                     return Ok(false);
                 }
-                reader
-                    .read_exact(&mut size[n..])
-                    .context("truncated BAM record size")?;
-                let len = i32::from_le_bytes(size);
-                if !(32..=MAX_BAM_RECORD as i32).contains(&len) {
-                    bail!("invalid BAM record size {len}");
-                }
-                buf.extend_from_slice(&size);
-                buf.resize(start + 4 + len as usize, 0);
-                reader
-                    .read_exact(&mut buf[start + 4..])
-                    .context("truncated BAM record")?;
+                // Payloads are at most seqair's 2 MiB record limit.
+                let size = u32::try_from(buf.len() - start - 4).context("BAM record size")?;
+                buf[start..start + 4].copy_from_slice(&size.to_le_bytes());
                 self.number += 1;
             }
         }
@@ -469,7 +453,9 @@ impl Input {
                 previous = Some(start);
                 continue;
             };
-            if start >= target {
+            // A mid-stream header line belongs with the group it interrupts:
+            // r985 prints it while that group is still buffered.
+            if start >= target && !is_header_line(format, &data[start..]) {
                 let key = group_key(format, &data[start..]);
                 if key.is_none() || key != group_key(format, &data[prev..start]) {
                     self.carry.extend_from_slice(&data[start..]);
@@ -507,21 +493,38 @@ impl Input {
         match &self.source {
             Source::Sam { .. } => SamRecord::parse(&buf)
                 .map(Some)
-                .map_err(anyhow::Error::from_boxed)
                 .with_context(|| format!("SAM line {number}")),
             Source::Bam { header, .. } => {
-                let mut record = BamRecord::default();
-                *record.buffer_mut() = buf.split_off(4);
-                let mut text = SamRecord::default();
-                record
-                    .validate(header)
-                    .and_then(|()| record.to_sam(header, &mut text))
-                    .map_err(anyhow::Error::from_boxed)
+                let record = RawBamRecord::from_payload(buf.split_off(4), header)
                     .with_context(|| format!("BAM record {number}"))?;
-                Ok(Some(text))
+                let mut text = Vec::new();
+                format::format_sam_record(&record, header, &mut text)
+                    .with_context(|| format!("BAM record {number}"))?;
+                SamRecord::parse(&text)
+                    .map(Some)
+                    .with_context(|| format!("BAM record {number}"))
             }
         }
     }
+}
+
+/// Whether a framed record is a SAM header line (`@...`).
+pub fn is_header_line(format: Format, record: &[u8]) -> bool {
+    format == Format::Sam && record.first() == Some(&b'@')
+}
+
+/// Read up to `n` bytes, fewer only at the end of input.
+fn read_prefix(reader: &mut impl Read, n: usize) -> io::Result<Vec<u8>> {
+    let mut prefix = Vec::with_capacity(n);
+    reader.by_ref().take(n as u64).read_to_end(&mut prefix)?;
+    Ok(prefix)
+}
+
+/// Report that SAM input stops early for an r985 compatibility reason.
+fn warn_stop(line: u64, why: &str) {
+    eprintln!(
+        "postalt_rs: warning: input stops at line {line} because {why} (as bwa-postalt.js does)"
+    );
 }
 
 /// Converts records to output bytes, keeping unchanged BAM records verbatim.
@@ -530,12 +533,12 @@ impl Input {
 /// names in the same order as the input's, which holds when the output header is
 /// the input's own text. Otherwise records go through SAM text and are re-encoded.
 pub struct Serializer {
-    format: Format,
     input: Option<Arc<BamHeader>>,
     output: Option<Arc<BamHeader>>,
     verbatim: bool,
-    text: SamRecord,
-    encoder: BamEncoder,
+    text: Vec<u8>,
+    encoder: SamRecordEncoder,
+    encoded: RawBamRecord,
 }
 impl Serializer {
     /// Serialize SAM, or BAM for the `output` dictionary (see
@@ -546,27 +549,29 @@ impl Serializer {
             _ => false,
         };
         Self {
-            format: if output.is_some() {
-                Format::Bam
-            } else {
-                Format::Sam
-            },
             input,
             output,
             verbatim,
-            text: SamRecord::default(),
-            encoder: BamEncoder::default(),
+            text: Vec::new(),
+            encoder: SamRecordEncoder::default(),
+            encoded: RawBamRecord::default(),
         }
     }
-    /// Append `record` to `out` in the output format.
+    /// Append `record` to `out` in the output format: a SAM line, or a BAM
+    /// `block_size` and payload.
     ///
     /// # Errors
     /// Returns BAM encoding errors (for example references missing from the
-    /// output dictionary). `out` is unchanged on error.
+    /// output dictionary) and BAM-to-SAM decoding errors (malformed aux data).
+    /// `out` is unchanged on error.
     pub fn write(&mut self, record: &Record, out: &mut Vec<u8>) -> Result<()> {
+        self.write_inner(record, out)
+            .with_context(|| format!("read {}", String::from_utf8_lossy(record.qname())))
+    }
+    fn write_inner(&mut self, record: &Record, out: &mut Vec<u8>) -> Result<()> {
         let text = match record {
             Record::Bam(bam) if self.verbatim => {
-                bam.append_bam(out);
+                append_payload(bam, out);
                 return Ok(());
             }
             Record::Bam(bam) => {
@@ -574,22 +579,52 @@ impl Serializer {
                     .input
                     .as_deref()
                     .context("BAM record without a header")?;
-                bam.to_sam(header, &mut self.text)
-                    .map_err(anyhow::Error::from_boxed)?;
-                &self.text
+                self.text.clear();
+                format::format_sam_record(bam, header, &mut self.text)?;
+                &self.text[..]
             }
-            Record::Sam(text) => text,
+            Record::Sam(text) => text.as_bytes(),
         };
-        match (self.format, &self.output) {
-            (Format::Bam, Some(header)) => text
-                .append_bam(header, &mut self.encoder, out)
-                .map_err(anyhow::Error::from_boxed),
-            _ => {
-                text.append_sam(out);
-                Ok(())
+        match &self.output {
+            Some(header) => {
+                self.encoder.encode(text, header, &mut self.encoded)?;
+                append_payload(&self.encoded, out);
+            }
+            None => {
+                out.extend_from_slice(text);
+                out.push(b'\n');
             }
         }
+        Ok(())
     }
+}
+
+impl Serializer {
+    /// Append a SAM header line found among the alignments (without its line
+    /// ending) to SAM output.
+    ///
+    /// # Errors
+    /// BAM output has nowhere to put it.
+    pub fn write_header_line(&self, line: &[u8], out: &mut Vec<u8>) -> Result<()> {
+        if self.output.is_some() {
+            bail!("a header line after the first alignment cannot be written to BAM");
+        }
+        let end = line
+            .iter()
+            .rposition(|&b| b != b'\r' && b != b'\n')
+            .map_or(0, |i| i + 1);
+        out.extend_from_slice(&line[..end]);
+        out.push(b'\n');
+        Ok(())
+    }
+}
+
+/// Append a record's `block_size` and payload.
+fn append_payload(record: &RawBamRecord, out: &mut Vec<u8>) {
+    let payload = record.as_payload();
+    // A valid record is at most seqair's 2 MiB limit.
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(payload);
 }
 
 /// Buffer small field writes before sending them to a file or stdout.
@@ -608,15 +643,18 @@ pub enum Output {
         writer: Box<BamWriter<OutputStream>>,
         /// Same dictionary used to initialize `writer`; do not replace midstream.
         header: Arc<BamHeader>,
+        /// A record being written, reused.
+        record: RawBamRecord,
     },
 }
 impl Output {
     /// Create/truncate a file or use stdout (`None`/`-`), then emit the header.
     ///
     /// `bam` selects format independently of the filename. SAM accepts empty
-    /// header text; BAM needs a valid `@SQ` dictionary. `threads` (at least one)
-    /// and `compression` (0..=12) configure BAM compression only. Callers must
-    /// ensure the output path does not alias an input they are still reading.
+    /// header text; BAM needs a valid UTF-8 `@SQ` dictionary. `threads` (at
+    /// least one) and `compression` (0..=12) configure BAM compression only.
+    /// Callers must ensure the output path does not alias an input they are
+    /// still reading.
     ///
     /// # Errors
     /// Returns invalid-header, create, compression-setup or header-write errors.
@@ -624,12 +662,13 @@ impl Output {
     pub fn create(
         path: Option<&Path>,
         bam: bool,
-        text: &str,
+        text: &[u8],
         threads: usize,
         compression: i32,
     ) -> Result<Self> {
         // Validate header before creating/truncating any output.
         let header = if bam {
+            let text = std::str::from_utf8(text).context("BAM output requires a UTF-8 header")?;
             Some(
                 BamHeader::from_sam_text(text)
                     .context("BAM output requires a SAM @SQ dictionary")?,
@@ -652,9 +691,10 @@ impl Output {
             Ok(Self::Bam {
                 writer: Box::new(writer),
                 header: Arc::new(header),
+                record: RawBamRecord::default(),
             })
         } else {
-            out.write_all(text.as_bytes())?;
+            out.write_all(text)?;
             Ok(Self::Sam(out))
         }
     }
@@ -668,31 +708,51 @@ impl Output {
     /// Write bytes produced by a [`Serializer`] for this output.
     ///
     /// # Errors
-    /// Propagates I/O, framing and compression errors. Writes can be partial;
-    /// callers should abort on failure.
+    /// Propagates I/O, record validation and compression errors. Writes can be
+    /// partial; callers should abort on failure.
     pub fn write_serialized(&mut self, data: &[u8]) -> Result<()> {
         match self {
             Self::Sam(out) => out.write_all(data)?,
-            Self::Bam { writer, header } => writer
-                .write_bam_records(data, header)
-                .map_err(anyhow::Error::from_boxed)?,
+            Self::Bam {
+                writer,
+                header,
+                record,
+            } => {
+                let mut rest = data;
+                while let Some((size, tail)) = rest.split_first_chunk::<4>() {
+                    let (payload, tail) = tail
+                        .split_at_checked(u32::from_le_bytes(*size) as usize)
+                        .context("serialized BAM record is truncated")?;
+                    // Reuse the record's allocation for each payload.
+                    let mut buffer = std::mem::take(record).into_payload();
+                    buffer.clear();
+                    buffer.extend_from_slice(payload);
+                    *record = RawBamRecord::from_payload(buffer, header)?;
+                    writer.write_raw(record)?;
+                    rest = tail;
+                }
+                if !rest.is_empty() {
+                    bail!("serialized BAM record size is truncated");
+                }
+            }
         }
         Ok(())
     }
-    /// Serialize and write one record using its authoritative flag/position/MAPQ.
+    /// Serialize and write one SAM record.
     ///
     /// # Errors
     /// Propagates I/O and serialization errors, including references absent from
     /// the BAM dictionary. Writes can be partial; callers should abort on failure.
     pub fn write(&mut self, record: &SamRecord) -> Result<()> {
-        let mut data = Vec::new();
         match self {
             Self::Sam(out) => record.write_sam(out)?,
-            Self::Bam { header, .. } => {
-                record
-                    .append_bam(header, &mut BamEncoder::default(), &mut data)
-                    .map_err(anyhow::Error::from_boxed)?;
-                self.write_serialized(&data)?;
+            Self::Bam {
+                writer,
+                header,
+                record: raw,
+            } => {
+                SamRecordEncoder::default().encode(record.as_bytes(), header, raw)?;
+                writer.write_raw(raw)?;
             }
         }
         Ok(())

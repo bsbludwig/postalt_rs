@@ -31,7 +31,7 @@
 //!
 //! # fn main() -> anyhow::Result<()> {
 //! let index = Arc::new(AltIndex::from_path(Path::new("reference.fa.alt"))?);
-//! let input = Input::open(None, 1)?; // stdin, one BAM decompression worker
+//! let input = Input::open(None, 1)?; // stdin, one BGZF decompression worker
 //! let mut output = Output::create(None, false, input.header_text(), 1, 6)?;
 //! let settings = Settings { ratio: 1.0, k8_compat: false, fastq: false };
 //! let headers = (input.bam_header().cloned(), output.bam_header().cloned());
@@ -44,3 +44,4 @@
 pub mod io;
 pub mod pipeline;
 pub mod postalt;
+pub mod sam_text;
